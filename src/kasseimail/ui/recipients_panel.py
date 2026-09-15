@@ -15,9 +15,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from kasseimail.recipients import RecipientProblem
+from kasseimail.recipients import GroupSpec, RecipientProblem
+from kasseimail.recipients import group as group_recipients
 from kasseimail.recipients import load as load_recipients
 from kasseimail.recipients import sheet_names
+from kasseimail.ui.aggregation_dialog import AggregationDialog
+
+#: what the group-by dropdown says when it is off.
+NO_GROUPING = "(no grouping)"
 
 #: kept pale so the text stays readable on either palette; the status column carries the words.
 ROW_COLOURS = {
@@ -47,7 +52,7 @@ class RecipientModel(QAbstractTableModel):
         if role != Qt.DisplayRole or orientation != Qt.Horizontal or self.table is None:
             return None
         if section == 0:
-            return "Row"
+            return "Rows" if self.table.grouped else "Row"
         if section == 1:
             return "Status"
         if section == 2:
@@ -68,12 +73,19 @@ class RecipientModel(QAbstractTableModel):
 
         if role == Qt.DisplayRole:
             if column == 0:
-                return recipient.row
+                # -- every row the group was built from, not just the first. A message covering
+                #    rows 2, 3 and 4 that says "2" reads as though the grouping did not happen.
+                rows = recipient.source_rows or [recipient.row]
+                return ", ".join(str(number) for number in rows)
             if column == 1:
                 return _status_of(plan)
             if column == 2:
                 return ", ".join(plan.resolution.names) if plan else ""
             return _display(recipient.fields.get(self.table.headers[column - 3], ""))
+
+        if role == Qt.ToolTipRole and column == 0 and recipient.grouped:
+            return (f"{recipient.count} spreadsheet rows, combined into one message: "
+                    + ", ".join(str(number) for number in recipient.source_rows))
 
         if role == Qt.ToolTipRole and plan is not None:
             problems = plan.errors + plan.warnings
@@ -147,7 +159,12 @@ class RecipientsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
+        # -- `raw_table` is the file as read, `table` is what the run will actually use. They are
+        #    the same object until a group column is chosen, and keeping both means changing the
+        #    grouping is instant and never needs the file read again.
+        self.raw_table = None
         self.table = None
+        self.group_spec = GroupSpec()
         self.model = RecipientModel()
         self._build()
 
@@ -181,6 +198,20 @@ class RecipientsPanel(QWidget):
         )
         self.key_box.currentTextChanged.connect(self._column_changed)
 
+        self.group_box = QComboBox()
+        self.group_box.setMinimumWidth(140)
+        self.group_box.setToolTip(
+            "One message per distinct value of this column instead of one per row -- for a file "
+            "where the same person appears on several rows. The other columns are combined; the "
+            "button beside this says how."
+        )
+        self.group_box.currentTextChanged.connect(self._grouping_changed)
+
+        self.aggregation_button = QPushButton("Combine...")
+        self.aggregation_button.setToolTip("How each column is combined across a group")
+        self.aggregation_button.clicked.connect(self._edit_aggregation)
+        self.aggregation_button.setEnabled(False)
+
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Recipients"))
         controls.addWidget(self.path_field, 1)
@@ -193,6 +224,16 @@ class RecipientsPanel(QWidget):
         controls.addWidget(QLabel("Key"))
         controls.addWidget(self.key_box)
 
+        self.summary = QLabel("")
+        self.summary.setStyleSheet("color: palette(mid);")
+
+        grouping = QHBoxLayout()
+        grouping.addWidget(QLabel("Group by"))
+        grouping.addWidget(self.group_box)
+        grouping.addWidget(self.aggregation_button)
+        grouping.addStretch(1)
+        grouping.addWidget(self.summary)
+
         self.view = QTableView()
         self.view.setModel(self.model)
         self.view.setSelectionBehavior(QTableView.SelectRows)
@@ -203,14 +244,11 @@ class RecipientsPanel(QWidget):
         self.view.horizontalHeader().setStretchLastSection(True)
         self.view.selectionModel().selectionChanged.connect(self._selection_changed)
 
-        self.summary = QLabel("")
-        self.summary.setStyleSheet("color: palette(mid);")
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(controls)
         layout.addWidget(self.view, 1)
-        layout.addWidget(self.summary)
+        layout.addLayout(grouping)
 
     # -- loading ------------------------------------------------------------------------------
 
@@ -241,17 +279,11 @@ class RecipientsPanel(QWidget):
             QMessageBox.warning(self, "Could not read that file", str(exc))
             return False
 
-        self.table = table
+        self.raw_table = table
         self.path_field.setText(str(path))
         self.reload_button.setEnabled(True)
         self._fill_boxes(sheets, chosen_sheet, table)
-        self.model.set_table(table)
-        self.view.resizeColumnsToContents()
-        self._show_summary()
-
-        self.table_loaded.emit(table)
-        if table.rows:
-            self.view.selectRow(0)
+        self._apply_grouping(select_first=True)
         return True
 
     def _preferred_email_column(self, path: Path, sheet) -> str:
@@ -278,9 +310,9 @@ class RecipientsPanel(QWidget):
         return "email"
 
     def reload(self) -> None:
-        if self.table is not None:
+        if self.raw_table is not None:
             self.load(
-                self.table.path,
+                self.raw_table.path,
                 sheet=self.sheet_box.currentText() or None,
                 email_column=self.email_box.currentText() or None,
                 key_column=self.key_box.currentText() or None,
@@ -304,22 +336,138 @@ class RecipientsPanel(QWidget):
         self.key_box.addItems(table.headers)
         self.key_box.setCurrentText(table.key_column)
 
+        wanted = self.group_box.currentText()
+        self.group_box.blockSignals(True)
+        self.group_box.clear()
+        self.group_box.addItems([NO_GROUPING] + table.headers)
+        # -- a grouping chosen before this file was opened survives if the column still exists,
+        #    so reloading after an edit does not quietly turn it off.
+        self.group_box.setCurrentText(wanted if wanted in table.headers else NO_GROUPING)
+        self.group_box.blockSignals(False)
+
         for box in (self.sheet_box, self.email_box, self.key_box):
             box.blockSignals(False)
 
     def _sheet_changed(self, name: str) -> None:
-        if name and self.table is not None:
-            self.load(self.table.path, sheet=name)
+        if name and self.raw_table is not None:
+            self.load(self.raw_table.path, sheet=name)
 
     def _column_changed(self, _name: str) -> None:
-        if self.table is None:
+        if self.raw_table is None:
             return
         self.load(
-            self.table.path,
+            self.raw_table.path,
             sheet=self.sheet_box.currentText() or None,
             email_column=self.email_box.currentText(),
             key_column=self.key_box.currentText(),
         )
+
+    # -- grouping -----------------------------------------------------------------------------
+
+    def _apply_grouping(self, select_first: bool = False) -> None:
+        """Rebuild the shown table from the raw one. Cheap: no file is read again."""
+        from PySide6.QtWidgets import QMessageBox
+
+        if self.raw_table is None:
+            return
+
+        column = self.group_box.currentText()
+        self.group_spec = GroupSpec(
+            by=column if column and column != NO_GROUPING else "",
+            aggregators=dict(self.group_spec.aggregators),
+        )
+        self.aggregation_button.setEnabled(self.group_spec.enabled)
+
+        try:
+            self.table = group_recipients(self.raw_table, self.group_spec)
+        except RecipientProblem as exc:
+            QMessageBox.warning(self, "Cannot group", str(exc))
+            self.table = self.raw_table
+            self.group_box.setCurrentText(NO_GROUPING)
+            return
+
+        self.model.set_table(self.table)
+        self.view.resizeColumnsToContents()
+        self._show_summary()
+        self.table_loaded.emit(self.table)
+
+        if select_first and self.table.rows:
+            self.view.selectRow(0)
+        else:
+            self._selection_changed()
+
+    def _grouping_changed(self, _column: str) -> None:
+        # -- an aggregation chosen for one column makes no sense against another grouping, and
+        #    silently carrying it over is how a total turns up on the wrong message.
+        self.group_spec.aggregators.clear()
+        self._apply_grouping(select_first=True)
+
+    def set_grouping(self, column: str, aggregators: dict | None = None) -> None:
+        """Group on this column, e.g. because the chosen template's meta.toml asks for it.
+
+        The combo's signal is blocked deliberately: `_grouping_changed` clears the aggregators,
+        which is right when a *person* picks another column and wrong here -- the aggregators are
+        being handed in by the same caller, and letting the signal through would throw away the
+        `aggregate` table of the template that just asked for this.
+        """
+        if self.raw_table is None:
+            return
+
+        wanted = column if column in self.raw_table.headers else NO_GROUPING
+
+        self.group_box.blockSignals(True)
+        self.group_box.setCurrentText(wanted)
+        self.group_box.blockSignals(False)
+
+        if aggregators is not None:
+            from kasseimail.recipients import normalise_header
+
+            self.group_spec.aggregators = {
+                normalise_header(name, 0): how for name, how in aggregators.items()
+            }
+
+        self._apply_grouping(select_first=True)
+
+    def _edit_aggregation(self) -> None:
+        if self.raw_table is None or not self.group_spec.enabled:
+            return
+
+        dialog = AggregationDialog(
+            self.raw_table.headers, self.raw_table.original_headers,
+            self.group_spec.aggregators, self.group_spec.by, self,
+        )
+        if dialog.exec() != dialog.Accepted:
+            return
+
+        self.group_spec.aggregators = dialog.aggregators()
+        self._apply_grouping()
+
+    # -- stepping -----------------------------------------------------------------------------
+
+    def step(self, delta: int) -> None:
+        """Move the selection by one, for the preview's ◀ ▶ buttons.
+
+        Stepping the *table* rather than keeping a separate index of its own is what makes this
+        work unchanged when grouping is on: the table already holds one line per message, so next
+        means the next message either way.
+        """
+        if self.table is None or not self.table.rows:
+            return
+
+        rows = self.view.selectionModel().selectedRows()
+        current = rows[0].row() if rows else -1
+        target = max(0, min(len(self.table.rows) - 1, current + delta))
+
+        if target != current:
+            self.view.selectRow(target)
+            self.view.scrollTo(self.model.index(target, 0))
+
+    def position(self) -> tuple[int, int]:
+        """Where the selection sits: (this one, how many). 1-based, for a person to read."""
+        if self.table is None or not self.table.rows:
+            return (0, 0)
+        rows = self.view.selectionModel().selectedRows()
+        return ((rows[0].row() + 1) if rows else 0, len(self.table.rows))
 
     # -- preflight ----------------------------------------------------------------------------
 
@@ -336,7 +484,12 @@ class RecipientsPanel(QWidget):
             self.summary.setText("")
             return
 
-        parts = [f"{len(self.table)} rows", f"{len(self.table.headers)} columns"]
+        if self.table.grouped:
+            parts = [f"{len(self.raw_table)} rows → {len(self.table)} messages "
+                     f"grouped by {self.table.group_by}"]
+        else:
+            parts = [f"{len(self.table)} rows"]
+        parts.append(f"{len(self.table.headers)} columns")
         if self.table.without_email:
             parts.append(f"{len(self.table.without_email)} without an address")
         if found is not None:

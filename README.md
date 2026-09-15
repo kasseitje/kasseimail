@@ -135,7 +135,76 @@ kasseimail validate -t welcome -d people.xlsx --columns
 - A row with no address is **skipped and named in the report** — nothing disappears quietly.
 - The same address on several rows is a warning, not an error, and gets one mail per row.
   Households share a mailbox, and sending three people one mail that is mostly about somebody else
-  is worse than sending three mails.
+  is worse than sending three mails. When it *is* one person booking three things, group the rows —
+  see below.
+
+## Grouping several rows into one mail
+
+A flea market books stands one row at a time, so the same person turns up three times with three
+stand numbers — and should get **one** mail listing all three.
+
+```bash
+kasseimail send -t market -d stands.xlsx --group-by email
+```
+
+The other columns are combined across the rows of the group. By default (`auto`) a column that reads
+the same on every row collapses to that one value and a column that differs becomes the list, so
+this needs nothing configured:
+
+| | |
+|---|---|
+| `{{ first_name }}` | `Jan` — the same on all three rows |
+| `{{ stand_number }}` | `12, 14, 19` — they differ, so they list |
+| `{{ count }}` | `3` |
+
+Override a column when `auto` is not what you meant:
+
+```bash
+kasseimail send -t market -d stands.xlsx --group-by email --aggregate price=sum
+```
+
+| aggregator | |
+|---|---|
+| `auto` | one value if every row agrees, otherwise the distinct values joined *(default)* |
+| `first` | the first row's value |
+| `list` | every row's value, joined, in order |
+| `unique` | the distinct values, joined |
+| `sum` | the numbers added up |
+| `count` | how many rows had a value |
+
+`--list-separator " / "` changes what joins them.
+
+**A template also gets the rows themselves**, as `rows`, which is what makes grouping more than
+joined strings:
+
+```jinja
+You booked {{ count }} stands, {{ price | money }} in total:
+{% for r in rows %}
+  stand {{ r.stand_number }} ({{ r.size }}) — {{ r.price | money }}
+{% endfor %}
+```
+
+**Attachments resolve per row, not per group.** `--attach-pattern "stand-{{ stand_number }}.pdf"`
+against a group of three attaches all three PDFs — rendered against the group it would go looking
+for `stand-12, 14, 19.pdf`.
+
+Two things worth knowing:
+
+- **A blank in the group column is never grouped.** Those rows would otherwise collapse into a
+  single recipient keyed on nothing — one mail standing for everybody the file failed to identify.
+- **The address is never a joined list.** Grouping on something other than the address takes the
+  first address in each group and warns when a group spans more than one, because that almost always
+  means the group column is not the one you wanted.
+
+A template can carry its own grouping, since one written to say *"your stands are 12, 14 and 19"*
+only makes sense against grouped rows:
+
+```toml
+group_by = "email"
+
+[aggregate]
+price = "sum"
+```
 
 ## Attachments
 
@@ -198,6 +267,15 @@ One window: the template list and an editor with a live preview rendered against
 the spreadsheet below it with the preflight result per row, and the run controls and the log at the
 bottom. The log pane shows the same loguru lines the CLI prints, live, while a run goes on in a
 worker thread — Cancel stops it between messages, never in the middle of one.
+
+- The **subject** has its own field above the body preview, because it is a separate field of the
+  message and the one line every recipient certainly reads.
+- **◀ ▶** step the preview through the recipients one at a time — the first, the last, and the one
+  you know is awkward — and the position reads `3 of 42`. They move the table's own selection, so
+  the table and the preview can never disagree about which recipient is on screen.
+- **Group by** collapses the table to one line per message, and **Combine...** says how each column
+  is aggregated. With grouping on, the arrows step between groups, and the Rows column names every
+  spreadsheet row each message came from.
 
 ## Output
 

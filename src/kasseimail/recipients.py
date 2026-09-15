@@ -26,7 +26,7 @@ from loguru import logger
 
 #: names the run puts into the context itself. A column normalising to one of these would be
 #: overwritten, so it is reported rather than silently lost.
-RESERVED_FIELDS = ("row", "attachments")
+RESERVED_FIELDS = ("row", "attachments", "rows", "count")
 
 #: deliberately loose. This is a typo check -- a missing `@`, a stray comma, a space in the middle
 #: -- not an RFC 5322 parser. Graph is the authority on whether an address exists; the job here is
@@ -87,6 +87,26 @@ class Recipient:
     email: str
     key: str
     fields: dict = field(default_factory=dict)
+    #: the spreadsheet rows this recipient was built from -- one, unless it is a group. Kept whole
+    #: rather than only aggregated, because a template that wants a table of the stands somebody
+    #: booked needs the rows, and because attachments resolve per row and not per group.
+    members: list[dict] = field(default_factory=list)
+    source_rows: list[int] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.members:
+            self.members = [dict(self.fields)]
+        if not self.source_rows:
+            self.source_rows = [self.row]
+
+    @property
+    def count(self) -> int:
+        """How many spreadsheet rows went into this message."""
+        return len(self.members)
+
+    @property
+    def grouped(self) -> bool:
+        return self.count > 1
 
     def context(self, *, attachments: list[str] | None = None) -> dict:
         """What a template renders against: the columns, plus what the run knows.
@@ -94,11 +114,18 @@ class Recipient:
         `email` is the *resolved* address, which under `--test-to` is not the one in the
         spreadsheet. A template printing it in a footer then says where the mail actually went,
         which is what somebody reading a rehearsal wants to see.
+
+        `rows` and `count` are what make grouping useful. The aggregated fields give you
+        `{{ stand_number }}` as "12, 14, 19", which is the common case; `rows` gives you the
+        rows behind it, so a template can lay them out as a list or a table with each stand's own
+        size and price beside it. Without them, grouping could only ever produce joined strings.
         """
         return dict(self.fields) | {
             "row": self.row,
             "email": self.email,
             "attachments": list(attachments or []),
+            "rows": [dict(member) for member in self.members],
+            "count": self.count,
         }
 
 
@@ -115,6 +142,12 @@ class RecipientTable:
     without_email: list[int] = field(default_factory=list)
     invalid_email: list[tuple[int, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: the column rows were collapsed on, empty when each row is its own message.
+    group_by: str = ""
+
+    @property
+    def grouped(self) -> bool:
+        return bool(self.group_by)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -312,3 +345,232 @@ def _header_warnings(headers: list[str], original: list[str]) -> list[str]:
             )
 
     return warnings
+
+
+# ---------------------------------------------------------------------------------------------
+# grouping
+# ---------------------------------------------------------------------------------------------
+#
+# Several rows, one message. A flea market books stands one row at a time, so the same person turns
+# up three times with three stand numbers -- and they should get one mail listing all three, not
+# three mails each mentioning one.
+#
+# Grouping collapses those rows into a single recipient and *aggregates* the other columns. What the
+# template then sees is both: `{{ stand_number }}` as "12, 14, 19", and `rows` as the three rows
+# themselves, for a template that wants to lay them out with each stand's size and price beside it.
+
+#: how a column's values are combined across the rows of a group.
+AGGREGATORS = ("auto", "first", "list", "unique", "sum", "count")
+
+DEFAULT_AGGREGATOR = "auto"
+DEFAULT_SEPARATOR = ", "
+
+#: what each one does, for `--help` and for the window's dropdown.
+AGGREGATOR_HELP = {
+    "auto": "one value if every row agrees, otherwise the distinct values joined",
+    "first": "the first row's value",
+    "list": "every row's value, joined, in order",
+    "unique": "the distinct values, joined, in order of first appearance",
+    "sum": "the numbers added up",
+    "count": "how many rows had a value",
+}
+
+
+def _as_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d") if value.time() == datetime.min.time() else str(value)
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    return str(value).strip()
+
+
+def _numeric(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(str(value).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def aggregate_values(values: list, how: str = DEFAULT_AGGREGATOR,
+                     separator: str = DEFAULT_SEPARATOR):
+    """Combine one column's values across the rows of a group.
+
+    `auto` is the default because it needs no configuration and is what people mean: a column that
+    is the same on every row of the group -- the name, the address -- collapses to that one value,
+    and a column that differs -- the stand number -- becomes the list. Grouping a flea market
+    spreadsheet by e-mail therefore does the right thing with nothing configured, and the explicit
+    aggregators are there for when it does not.
+    """
+    if how not in AGGREGATORS:
+        raise RecipientProblem(
+            f"Unknown aggregator '{how}'. Use one of: {', '.join(AGGREGATORS)}"
+        )
+
+    present = [value for value in values if _as_text(value) != ""]
+
+    if how == "count":
+        return len(present)
+
+    if how == "sum":
+        numbers = [number for number in (_numeric(value) for value in present)
+                   if number is not None]
+        if not numbers:
+            return ""
+        total = sum(numbers)
+        # -- whole numbers stay whole: a total of 3 stands must not read as 3.0.
+        return int(total) if float(total).is_integer() else total
+
+    if not present:
+        return ""
+
+    if how == "first":
+        return present[0]
+
+    texts = [_as_text(value) for value in present]
+
+    if how == "list":
+        return separator.join(texts)
+
+    distinct = list(dict.fromkeys(texts))
+
+    if how == "unique":
+        return separator.join(distinct)
+
+    # -- auto
+    if len(distinct) == 1:
+        # -- the original value, not its text: a date stays a date so `| date(...)` still works.
+        return present[0]
+    return separator.join(distinct)
+
+
+@dataclass
+class GroupSpec:
+    """How to collapse several rows into one message."""
+
+    by: str = ""
+    aggregators: dict = field(default_factory=dict)
+    separator: str = DEFAULT_SEPARATOR
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.by)
+
+    def how(self, column: str) -> str:
+        return self.aggregators.get(column, DEFAULT_AGGREGATOR)
+
+    @classmethod
+    def parse(cls, by: str | None, pairs=(), separator: str = DEFAULT_SEPARATOR) -> "GroupSpec":
+        """From the command line: `--group-by email --aggregate stand_number=list`."""
+        aggregators = {}
+        for pair in pairs or ():
+            column, _, how = str(pair).partition("=")
+            column, how = column.strip(), how.strip().lower()
+            if not column or not how:
+                raise RecipientProblem(
+                    f"--aggregate wants COLUMN=HOW, not {pair!r}. "
+                    f"HOW is one of: {', '.join(AGGREGATORS)}"
+                )
+            if how not in AGGREGATORS:
+                raise RecipientProblem(
+                    f"Unknown aggregator '{how}' for column '{column}'. "
+                    f"Use one of: {', '.join(AGGREGATORS)}"
+                )
+            aggregators[normalise_header(column, 0)] = how
+
+        return cls(by=normalise_header(by, 0) if by else "", aggregators=aggregators,
+                   separator=separator)
+
+
+def group(table: RecipientTable, spec: GroupSpec) -> RecipientTable:
+    """One recipient per distinct value of the group column. Returns a new table.
+
+    **A blank group value is never grouped.** Rows with no value in that column would otherwise all
+    collapse into a single recipient keyed on the empty string -- which is one mail standing for
+    everybody the file failed to identify, and the worst possible way to lose them.
+
+    The address is taken from the first row of the group rather than aggregated: a joined list of
+    addresses is not something Graph can send to. A group that spans two different addresses is a
+    warning, because it means the group column is not the one you wanted.
+    """
+    if not spec.enabled:
+        return table
+
+    if spec.by not in table.headers:
+        raise RecipientProblem(
+            f"Cannot group by '{spec.by}': {table.path.name} has "
+            f"{', '.join(table.headers)}"
+        )
+
+    for column in spec.aggregators:
+        if column not in table.headers:
+            raise RecipientProblem(
+                f"Cannot aggregate '{column}': {table.path.name} has "
+                f"{', '.join(table.headers)}"
+            )
+
+    buckets: dict[object, list[Recipient]] = {}
+    for recipient in table.rows:
+        value = _as_text(recipient.fields.get(spec.by, ""))
+        # -- a blank groups only with itself; the row number makes the bucket unique.
+        bucket = value.lower() if value else ("", recipient.row)
+        buckets.setdefault(bucket, []).append(recipient)
+
+    grouped, warnings = [], list(table.warnings)
+
+    for members in buckets.values():
+        first = members[0]
+        fields = {}
+        for column in table.headers:
+            values = [member.fields.get(column, "") for member in members]
+            fields[column] = aggregate_values(values, spec.how(column), spec.separator)
+
+        addresses = list(dict.fromkeys(
+            _as_text(member.email) for member in members if _as_text(member.email)
+        ))
+        if len(addresses) > 1:
+            warnings.append(
+                f"the group '{_as_text(first.fields.get(spec.by))}' spans "
+                f"{len(addresses)} addresses ({', '.join(addresses)}); it goes to the first"
+            )
+
+        # -- the address is never the aggregated value: it has to stay one address.
+        fields[table.email_column] = addresses[0] if addresses else ""
+
+        address = addresses[0] if addresses else ""
+        # -- the key names this message in the report and is half of what --resume matches on, so
+        #    it has to be there even for a group with no address at all.
+        key = _as_text(fields.get(table.key_column, "")) or address or f"row-{first.row}"
+
+        grouped.append(Recipient(
+            row=first.row,
+            email=address,
+            key=key,
+            fields=fields,
+            members=[dict(member.fields) for member in members],
+            source_rows=[member.row for member in members],
+        ))
+
+    collapsed = len(table.rows) - len(grouped)
+    if collapsed:
+        logger.info("grouped {} rows into {} message(s) by '{}'",
+                    len(table.rows), len(grouped), spec.by)
+
+    return RecipientTable(
+        path=table.path,
+        headers=table.headers,
+        original_headers=table.original_headers,
+        rows=grouped,
+        email_column=table.email_column,
+        key_column=table.key_column,
+        without_email=[r.row for r in grouped if not r.email],
+        invalid_email=[(r.row, r.email) for r in grouped
+                       if r.email and not EMAIL_PATTERN.match(r.email)],
+        warnings=warnings,
+        group_by=spec.by,
+    )

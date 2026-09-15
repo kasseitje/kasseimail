@@ -97,9 +97,12 @@ class MainWindow(QMainWindow):
         helped.addAction("About", self._about)
 
     def _connect(self) -> None:
-        self.recipients.row_selected.connect(self.templates.set_preview_row)
+        self.recipients.row_selected.connect(self._preview_row)
         self.recipients.table_loaded.connect(lambda _table: self._clear_preflight())
-        self.templates.template_changed.connect(lambda _name: self._clear_preflight())
+        self.templates.template_changed.connect(self._on_template_changed)
+        # -- the ◀ ▶ buttons move the *table's* selection rather than a separate index, so the
+        #    table and the preview can never end up showing different recipients.
+        self.templates.navigate.connect(self.recipients.step)
 
         self.send.validate_requested.connect(self._validate)
         self.send.run_requested.connect(self._run)
@@ -115,7 +118,25 @@ class MainWindow(QMainWindow):
         self.signin.finished.connect(self._on_signed_in)
         self.signin.failed.connect(self._on_signin_failed)
 
-    # -- building a run -------------------------------------------------------------------------
+    def _preview_row(self, recipient) -> None:
+        position, total = self.recipients.position()
+        self.templates.set_preview_row(recipient, position, total)
+
+    def _on_template_changed(self, name: str) -> None:
+        """A new template: drop the stale preflight, and adopt any grouping it asks for.
+
+        A template that writes "your stands are 12, 14 and 19" only makes sense against grouped
+        rows, so `meta.toml` carrying `group_by` should set it here too -- otherwise the window
+        silently does something different from the command line running the same template.
+        """
+        self._clear_preflight()
+
+        template = self.templates.template
+        if template is not None and template.meta.group_by and self.recipients.raw_table is not None:
+            self.recipients.set_grouping(template.meta.group_by, template.meta.aggregate)
+            logger.info("template '{}' groups rows by '{}'", name, template.meta.group_by)
+
+        self._preview_row(self.recipients.current_recipient())
 
     def _build_run(self, mode: str) -> SendRun | None:
         """The one place a `SendRun` is made, so every button gets the same object.

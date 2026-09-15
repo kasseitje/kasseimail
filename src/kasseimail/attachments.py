@@ -96,24 +96,35 @@ class AttachmentSpec:
     # -- the three sources --------------------------------------------------------------------
 
     def _candidates(self, recipient, template: Template, found: Resolution) -> list[str]:
-        """Every path-ish string this row asks for, patterns already rendered."""
+        """Every path-ish string this recipient asks for, patterns already rendered.
+
+        **Columns and patterns are read per member row, not off the aggregated value.** A grouped
+        recipient is several spreadsheet rows, and both of those things are per-row facts: three
+        stands booked on three rows want three PDFs, and `invoices/{{ stand_number }}.pdf` has to
+        render once per stand to name them. Rendered against the group it would be handed
+        "12, 14, 19" and go looking for `invoices/12, 14, 19.pdf`.
+
+        For an ungrouped recipient there is exactly one member, so this is the same work it always
+        did.
+        """
         candidates = list(self.common)
 
-        for column in self.columns:
-            cell = recipient.fields.get(column)
-            if cell in (None, ""):
-                continue
-            candidates.extend(_split_cell(str(cell)))
+        for member, context in _member_contexts(recipient):
+            for column in self.columns:
+                cell = member.get(column)
+                if cell in (None, ""):
+                    continue
+                candidates.extend(_split_cell(str(cell)))
 
-        if self.patterns:
-            context = recipient.context()
             for pattern in self.patterns:
                 try:
                     rendered = template.render_string(pattern, context).strip()
                 except TemplateProblem as exc:
                     # -- a pattern naming a column that is not there. Reported per row rather than
                     #    raised, so the preflight can list every row it affects in one pass.
-                    found.errors.append(f"attachment pattern {pattern!r}: {exc}")
+                    message = f"attachment pattern {pattern!r}: {exc}"
+                    if message not in found.errors:
+                        found.errors.append(message)
                     continue
                 if rendered:
                     candidates.append(rendered)
@@ -153,6 +164,18 @@ class AttachmentSpec:
             )
             return
         found.attachments.append(Attachment(path=path.resolve(), size=size))
+
+
+def _member_contexts(recipient):
+    """Each spreadsheet row behind this recipient, with a context to render a pattern against.
+
+    The context is the member's own fields over the group's, so `{{ stand_number }}` in a pattern
+    is *this* stand while `{{ first_name }}` still resolves even if only the group carries it.
+    """
+    group_context = recipient.context()
+
+    for member in recipient.members:
+        yield member, group_context | dict(member)
 
 
 def _split_cell(cell: str) -> list[str]:

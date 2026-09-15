@@ -24,7 +24,11 @@ from kasseimail import config, logs
 from kasseimail.attachments import AttachmentSpec
 from kasseimail.graph import GraphMailer, SignInProblem
 from kasseimail.ledger import MODE_DRAFTS, MODE_DRY_RUN, MODE_SEND
-from kasseimail.recipients import RecipientProblem
+from kasseimail.recipients import (
+    AGGREGATOR_HELP, AGGREGATORS, DEFAULT_AGGREGATOR, DEFAULT_SEPARATOR, GroupSpec,
+    RecipientProblem,
+)
+from kasseimail.recipients import group as group_recipients
 from kasseimail.recipients import load as load_recipients
 from kasseimail.run import RunProblem, SendRun
 from kasseimail.templates import PARTS, TemplateProblem, TemplateSet
@@ -81,6 +85,16 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--key-column", metavar="COLUMN",
                       help="what identifies a row in the report, for --resume "
                            "(default: the email column)")
+    send.add_argument("--group-by", metavar="COLUMN",
+                      help="one message per distinct value of this column instead of one per row. "
+                           "Use it when the same person appears on several rows.")
+    send.add_argument("--aggregate", action="append", default=[], metavar="COLUMN=HOW",
+                      help="how to combine a column across a group; repeatable. HOW is one of "
+                           + ", ".join(AGGREGATORS)
+                           + f" (default: {DEFAULT_AGGREGATOR} -- "
+                           + AGGREGATOR_HELP[DEFAULT_AGGREGATOR] + ")")
+    send.add_argument("--list-separator", default=DEFAULT_SEPARATOR, metavar="TEXT",
+                      help=f"what joins the values of a listed column (default: {DEFAULT_SEPARATOR!r})")
 
     delivery = send.add_mutually_exclusive_group()
     delivery.add_argument("--drafts", action="store_true",
@@ -129,6 +143,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--sheet", metavar="NAME")
     validate.add_argument("--email-column", default="email", metavar="COLUMN")
     validate.add_argument("--key-column", metavar="COLUMN")
+    validate.add_argument("--group-by", metavar="COLUMN")
+    validate.add_argument("--aggregate", action="append", default=[], metavar="COLUMN=HOW")
+    validate.add_argument("--list-separator", default=DEFAULT_SEPARATOR, metavar="TEXT")
     validate.add_argument("--attach", action="append", default=[], metavar="FILE")
     validate.add_argument("--attach-pattern", action="append", default=[], metavar="PATTERN")
     validate.add_argument("--attachment-column", action="append", default=[], metavar="COLUMN")
@@ -242,6 +259,16 @@ def _build_run(args, settings, mode: str) -> SendRun:
         email_column=args.email_column,
         key_column=args.key_column,
     )
+
+    # -- the template's own grouping is the default; a flag on the command line overrides it. A
+    #    template that writes "your stands are 12, 14 and 19" is written for grouped rows, so it
+    #    should not need the right flag typed alongside it every time.
+    spec = GroupSpec.parse(
+        args.group_by or template.meta.group_by,
+        args.aggregate or [f"{column}={how}" for column, how in template.meta.aggregate.items()],
+        separator=args.list_separator,
+    )
+    table = group_recipients(table, spec)
 
     root = Path(args.attachment_root).expanduser() if args.attachment_root else table.path.parent
     spec = AttachmentSpec(

@@ -99,10 +99,28 @@ def test_selecting_a_row_previews_the_template_against_it(window):
     placeholder text it would show none of the things that actually go wrong."""
     window.recipients.view.selectRow(0)
 
-    preview = window.templates.preview.toPlainText()
+    assert "Dear Jan" in window.templates.preview.toPlainText()
 
-    assert "Invoice 1001 for Peeters & Zn" in preview
-    assert "Dear Jan" in preview
+
+def test_the_subject_is_its_own_field_and_not_part_of_the_body(window):
+    """It is a separate field of the message and the one line every recipient certainly reads.
+    Folded in above the body it was the easiest thing on this screen to skim past."""
+    window.recipients.view.selectRow(0)
+
+    assert window.templates.subject_field.text() == "Invoice 1001 for Peeters & Zn"
+    assert "Invoice 1001" not in window.templates.preview.toPlainText()
+
+
+def test_a_row_that_will_not_render_leaves_no_stale_subject_behind(window):
+    """A subject left over from the previous row, beside an error about this one, is a preview
+    that contradicts itself."""
+    window.recipients.view.selectRow(0)
+    assert window.templates.subject_field.text()
+
+    window.templates._editors["subject.j2"].setPlainText("{{ not_a_column }}\n")
+    window.templates._flush()
+
+    assert window.templates.subject_field.text() == ""
 
 
 def test_the_preview_never_shows_a_number_as_a_float(window):
@@ -188,7 +206,7 @@ def test_the_row_number_shown_is_the_spreadsheet_s_own(window):
     model = window.recipients.model
 
     assert [model.data(model.index(r, 0), Qt.DisplayRole) for r in range(model.rowCount())] == \
-        [2, 3, 4, 5]
+        ["2", "3", "4", "5"]
 
 
 def test_an_empty_model_does_not_fall_over():
@@ -480,3 +498,130 @@ def test_credentials_microsoft_rejects_do_not_take_the_window_down(qt_app, templ
     finally:
         built.log.detach()
         built.close()
+
+
+# -- stepping through the list -----------------------------------------------------------------
+
+def test_the_arrows_step_the_preview_through_the_recipients(window):
+    """Clicking rows in the table does this too, but the table is panes away from the text you
+    are reading. The arrows move the table's own selection rather than a private index, so the
+    two can never end up showing different recipients."""
+    window.recipients.view.selectRow(0)
+    assert window.templates.position == (1, 4)
+
+    window.templates.navigate.emit(1)
+
+    assert window.templates.position == (2, 4)
+    assert "Dear An" in window.templates.preview.toPlainText()
+    assert window.recipients.current_recipient().row == 3
+
+
+def test_stepping_stops_at_both_ends_instead_of_wrapping(window):
+    """Wrapping from the last to the first looks like the button did nothing, only worse: you are
+    now reading row 2 believing it is row 40."""
+    window.recipients.view.selectRow(0)
+    window.templates.navigate.emit(-1)
+
+    assert window.templates.position == (1, 4)
+
+    window.recipients.view.selectRow(3)
+    window.templates.navigate.emit(1)
+
+    assert window.templates.position == (4, 4)
+
+
+def test_the_arrows_are_disabled_at_the_ends(window):
+    """A button that is clickable and does nothing is a button you press twice."""
+    window.recipients.view.selectRow(0)
+    assert not window.templates.previous_button.isEnabled()
+    assert window.templates.next_button.isEnabled()
+
+    window.recipients.view.selectRow(3)
+    assert window.templates.previous_button.isEnabled()
+    assert not window.templates.next_button.isEnabled()
+
+
+# -- grouping ------------------------------------------------------------------------------------
+
+def test_grouping_collapses_the_table_to_one_line_per_message(window):
+    """The table's job is one line per message. With grouping on it has to show the groups, or it
+    is describing a run that is not the one about to happen."""
+    assert len(window.recipients.table) == 4
+
+    window.recipients.set_grouping("email")
+
+    assert len(window.recipients.table) == 3           # jan appears twice
+    assert window.recipients.table.grouped
+
+
+def test_a_grouped_line_names_every_row_it_came_from(window):
+    """"2" on a message covering rows 2 and 5 reads as though the grouping did not happen."""
+    window.recipients.set_grouping("email")
+    model = window.recipients.model
+
+    shown = [model.data(model.index(r, 0), Qt.DisplayRole) for r in range(model.rowCount())]
+
+    assert "2, 5" in shown
+
+
+def test_the_preview_of_a_group_says_which_rows_it_covers(window):
+    window.recipients.set_grouping("email")
+    window.recipients.view.selectRow(0)
+
+    assert "rows 2, 5" in window.templates.preview_for.text()
+
+
+def test_stepping_moves_between_groups_once_grouping_is_on(window):
+    """Next means the next *message*, which is the next group -- not the next spreadsheet row."""
+    window.recipients.set_grouping("email")
+    window.recipients.view.selectRow(0)
+
+    assert window.templates.position == (1, 3)
+
+    window.templates.navigate.emit(1)
+
+    assert window.templates.position == (2, 3)
+
+
+def test_turning_grouping_off_puts_every_row_back(window):
+    from kasseimail.ui.recipients_panel import NO_GROUPING
+
+    window.recipients.set_grouping("email")
+    assert len(window.recipients.table) == 3
+
+    window.recipients.group_box.setCurrentText(NO_GROUPING)
+
+    assert len(window.recipients.table) == 4
+    assert not window.recipients.table.grouped
+
+
+def test_grouping_is_what_the_run_is_built_from(window):
+    """The window must not show groups and then send per row."""
+    window.recipients.set_grouping("email")
+
+    run = window._build_run(MODE_SEND)
+
+    assert len(run.table) == 3
+
+
+def test_a_template_that_asks_for_grouping_gets_it(window, make_template):
+    """meta.toml carrying `group_by` has to work in the window too, or the same template does one
+    thing from the command line and another here."""
+    make_template("stands", subject="Your stands\n", html="<p>{{ company }}</p>\n",
+                  meta='group_by = "email"\n')
+    window.templates.reload()
+    window.templates.select("stands")
+
+    assert window.recipients.table.grouped
+    assert window.recipients.group_box.currentText() == "email"
+
+
+def test_changing_the_group_column_forgets_the_old_aggregators(window):
+    """An aggregation chosen for one grouping makes no sense against another, and carrying it over
+    silently is how a total turns up on the wrong message."""
+    window.recipients.set_grouping("email", {"amount": "sum"})
+    assert window.recipients.group_spec.aggregators == {"amount": "sum"}
+
+    window.recipients.group_box.setCurrentText("company")
+
+    assert window.recipients.group_spec.aggregators == {}

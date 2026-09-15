@@ -130,6 +130,11 @@ class TemplateMeta:
     bcc: list[str] = field(default_factory=list)
     reply_to: list[str] = field(default_factory=list)
     required: list[str] = field(default_factory=list)
+    #: collapse several rows into one message -- the column to group on, and how to combine the
+    #: other columns. A template written to say "your stands are 12, 14 and 19" only makes sense
+    #: against grouped rows, so it carries that with it rather than relying on the right flag.
+    group_by: str = ""
+    aggregate: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> "TemplateMeta":
@@ -152,6 +157,9 @@ class TemplateMeta:
             bcc=as_list(raw.get("bcc")),
             reply_to=as_list(raw.get("reply_to")),
             required=as_list(raw.get("required")),
+            group_by=str(raw.get("group_by", "") or ""),
+            aggregate={str(column): str(how)
+                       for column, how in (raw.get("aggregate") or {}).items()},
         )
 
 

@@ -12,8 +12,9 @@ against row two, all three are visible before anybody presses send.
 
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QInputDialog, QLabel, QListWidget, QMessageBox, QPlainTextEdit,
-    QPushButton, QSplitter, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
+    QComboBox, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMessageBox,
+    QPlainTextEdit, QPushButton, QSplitter, QTabWidget, QTextBrowser, QToolButton, QVBoxLayout,
+    QWidget,
 )
 from PySide6.QtCore import Qt
 
@@ -37,6 +38,10 @@ class TemplatePanel(QWidget):
     """The left-hand list and the editor beside it."""
 
     template_changed = Signal(str)
+    #: step the preview to another recipient: -1 for the previous, +1 for the next. The window
+    #: turns it into a selection in the recipients table, so the table and the preview can never
+    #: disagree about which one is being looked at.
+    navigate = Signal(int)
 
     def __init__(self, template_dir, parent=None):
         super().__init__(parent)
@@ -44,6 +49,7 @@ class TemplatePanel(QWidget):
         self.templates = TemplateSet(template_dir)
         self.template = None
         self.preview_row = None
+        self.position = (0, 0)
 
         self._editors: dict[str, QPlainTextEdit] = {}
         self._dirty: set[str] = set()
@@ -107,10 +113,45 @@ class TemplatePanel(QWidget):
         self.preview_for = QLabel("no row selected")
         self.preview_for.setStyleSheet("color: palette(mid);")
 
+        # -- stepping through the list is how you check a run: the first, the last, and the one
+        #    you know is awkward. Clicking rows in the table below does it too, but that table is
+        #    three panes away from the text you are reading.
+        self.previous_button = QToolButton()
+        self.previous_button.setText("◀")
+        self.previous_button.setToolTip("Preview the previous recipient")
+        self.previous_button.clicked.connect(lambda: self.navigate.emit(-1))
+
+        self.next_button = QToolButton()
+        self.next_button.setText("▶")
+        self.next_button.setToolTip("Preview the next recipient")
+        self.next_button.clicked.connect(lambda: self.navigate.emit(1))
+
+        self.position_label = QLabel("—")
+        self.position_label.setStyleSheet("color: palette(mid);")
+        self.position_label.setMinimumWidth(96)
+        self.position_label.setAlignment(Qt.AlignCenter)
+
         preview_head = QHBoxLayout()
         preview_head.addWidget(QLabel("Preview"))
         preview_head.addWidget(self.preview_for, 1)
+        preview_head.addWidget(self.previous_button)
+        preview_head.addWidget(self.position_label)
+        preview_head.addWidget(self.next_button)
         preview_head.addWidget(self.preview_mode)
+
+        # -- the subject on its own line, not folded into the body. It is a separate field of the
+        #    message, it is the one line every recipient certainly reads, and buried above the body
+        #    it was the easiest thing on this screen to skim past.
+        self.subject_field = QLineEdit()
+        self.subject_field.setReadOnly(True)
+        self.subject_field.setPlaceholderText("the rendered subject appears here")
+        subject_font = self.subject_field.font()
+        subject_font.setBold(True)
+        self.subject_field.setFont(subject_font)
+
+        subject_form = QFormLayout()
+        subject_form.setContentsMargins(0, 4, 0, 4)
+        subject_form.addRow("Subject", self.subject_field)
 
         self.preview = QTextBrowser()
         self.preview.setOpenExternalLinks(False)
@@ -118,6 +159,7 @@ class TemplatePanel(QWidget):
         preview_box = QVBoxLayout()
         preview_box.setContentsMargins(0, 0, 0, 0)
         preview_box.addLayout(preview_head)
+        preview_box.addLayout(subject_form)
         preview_box.addWidget(self.preview, 1)
 
         preview_widget = QWidget()
@@ -224,19 +266,39 @@ class TemplatePanel(QWidget):
 
     # -- the preview --------------------------------------------------------------------------
 
-    def set_preview_row(self, recipient) -> None:
+    def set_preview_row(self, recipient, position: int = 0, total: int = 0) -> None:
+        """Preview this recipient, and say where it sits in the list.
+
+        A grouped recipient is several spreadsheet rows, so it is named by all of them -- "rows
+        2, 3, 4" -- and not by the first. Seeing "row 2" on a message that covers three of them is
+        how you end up believing the grouping did not happen.
+        """
         self.preview_row = recipient
-        self.preview_for.setText(
-            f"row {recipient.row} — {recipient.email or 'no address'}" if recipient
-            else "no row selected"
-        )
+        self.position = (position, total)
+
+        if recipient is None:
+            self.preview_for.setText("no row selected")
+        else:
+            rows = getattr(recipient, "source_rows", None) or [recipient.row]
+            where = f"row {rows[0]}" if len(rows) == 1 else \
+                f"rows {', '.join(str(number) for number in rows)}"
+            self.preview_for.setText(f"{where} — {recipient.email or 'no address'}")
+
+        self._show_position()
         self.refresh_preview()
+
+    def _show_position(self) -> None:
+        position, total = self.position
+        self.position_label.setText(f"{position} of {total}" if total else "—")
+        self.previous_button.setEnabled(total > 1 and position > 1)
+        self.next_button.setEnabled(total > 1 and position < total)
 
     def refresh_preview(self) -> None:
         if self.template is None:
             return
 
         if self.preview_row is None:
+            self.subject_field.clear()
             self.preview.setPlainText(
                 "Load a spreadsheet below to preview this template against a real row.\n\n"
                 "Rendering against actual values is the point: a column that is not there, a date "
@@ -250,6 +312,8 @@ class TemplatePanel(QWidget):
         except TemplateProblem as exc:
             # -- shown in place rather than as a dialog: while you are typing, a half-finished
             #    `{{ ` is an error on nearly every keystroke and a dialog each time is unusable.
+            self.subject_field.clear()
+            self.subject_field.setPlaceholderText("this row does not render yet")
             self.preview.setHtml(
                 "<div style='font-family:sans-serif'>"
                 "<p style='color:#c62828'><b>Cannot render this row yet</b></p>"
@@ -257,16 +321,17 @@ class TemplatePanel(QWidget):
             )
             return
 
+        self.subject_field.setText(rendered.subject)
+        self.subject_field.setCursorPosition(0)
+        self.subject_field.setToolTip(rendered.subject)
+
         body = rendered.html or rendered.text or ""
 
+        # -- the subject is in its own field above, so the body shown here is only the body.
         if self.preview_mode.currentText() == "Source" or not rendered.html:
-            self.preview.setPlainText(f"Subject: {rendered.subject}\n\n{body}")
+            self.preview.setPlainText(body)
         else:
-            self.preview.setHtml(
-                f"<div style='font-family:sans-serif;color:palette(mid);"
-                f"border-bottom:1px solid palette(mid);padding-bottom:4px;margin-bottom:10px'>"
-                f"<b>Subject:</b> {_escape(rendered.subject)}</div>{rendered.html}"
-            )
+            self.preview.setHtml(rendered.html)
 
     # -- the buttons --------------------------------------------------------------------------
 

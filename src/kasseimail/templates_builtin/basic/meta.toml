@@ -17,3 +17,14 @@ attachments = []
 cc = []
 bcc = []
 reply_to = []
+
+# -- One message per person instead of one per row, for a sheet where the same address appears
+#    several times -- a flea market booking stands one row at a time, say. The other columns are
+#    combined across the rows of a group; by default a column that reads the same on every row
+#    collapses to that value and one that differs becomes "12, 14, 19".
+#
+# group_by = "email"
+#
+# [aggregate]
+# price = "sum"           # auto | first | list | unique | sum | count
+

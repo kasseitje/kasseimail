@@ -8,6 +8,9 @@
         row            the row number in the source file, 1-based
         email          the resolved address for this row
         attachments    the filenames attached to this message
+        count          how many spreadsheet rows this message covers (1 unless grouping)
+        rows           those rows themselves, when several were grouped into one message:
+                         {% for r in rows %}{{ r.stand_number }}{% endfor %}
 
       Filters:
         {{ due | date("%d %B %Y") }}   a spreadsheet date, formatted

@@ -95,6 +95,35 @@ before any real work.
 - A **datetime stays a datetime**, for the `date` filter. Rendered raw it is `2026-03-01 00:00:00`.
 - Headers normalise to Jinja-typeable names: `First Name` → `{{ first_name }}`.
 
+## Grouping
+
+`recipients.group()` collapses several rows into one `Recipient` when a group column is given. The
+aggregated values land in `fields` as usual, and the rows behind them are kept in `members` /
+`source_rows` — both halves matter:
+
+- `fields` gives `{{ stand_number }}` as `"12, 14, 19"`, which is the common case.
+- `members` reaches the template as `rows`, so it can lay them out with each stand's size beside it.
+  Without that, grouping could only ever produce joined strings.
+- **`AttachmentSpec` resolves per member**, not off the aggregated value. A pattern rendered against
+  the group would go looking for `stand-12, 14, 19.pdf`. For an ungrouped recipient there is exactly
+  one member, so it is the same work it always did.
+
+`auto` is the default aggregator because it needs no configuration and is what people mean: same on
+every row → that value, differs → the distinct values joined. It returns the *original* value when
+the rows agree, so a date stays a date and `| date(...)` still works.
+
+Two invariants that are easy to break:
+
+- **A blank group value is never grouped.** Those rows would collapse into one recipient keyed on
+  the empty string — a single message standing for everybody the file failed to identify.
+- **The address is never aggregated.** Graph cannot send to a joined list, so a group takes the
+  first address and warns when it spans more than one.
+
+The window keeps `raw_table` (as read) and `table` (grouped) separately, so changing the grouping
+never re-reads the file. `set_grouping` blocks the combo's signal deliberately — `_grouping_changed`
+clears the aggregators, which is right when a person picks another column and wrong when a template's
+`meta.aggregate` is being handed in.
+
 ## Threading in the window
 
 `ui/worker.py` moves a `SendWorker` onto a `QThread`. Cancel is a `threading.Event` polled *between*
