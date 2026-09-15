@@ -5,7 +5,7 @@ keep showing what the worker is doing -- including the sign-in failing, which is
 somebody is staring at this window.
 """
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout,
@@ -14,6 +14,10 @@ from PySide6.QtWidgets import (
 
 class DeviceCodeDialog(QDialog):
     """Shows the code and opens the verification page."""
+
+    #: the sign-in should be called off -- the button says so, so it has to mean it. Hiding the
+    #: dialog alone would leave a thread polling for a quarter of an hour with nothing on screen.
+    cancelled = Signal()
 
     def __init__(self, flow: dict, parent=None):
         super().__init__(parent)
@@ -47,8 +51,8 @@ class DeviceCodeDialog(QDialog):
         open_button.setDefault(True)
         open_button.clicked.connect(self._open)
 
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.hide)
+        close_button = QPushButton("Cancel sign-in")
+        close_button.clicked.connect(self._cancel)
 
         where = QLabel(f'<a href="{self.url}">{self.url}</a>')
         where.setOpenExternalLinks(True)
@@ -69,6 +73,15 @@ class DeviceCodeDialog(QDialog):
         layout.addWidget(where)
         layout.addLayout(buttons)
         layout.addWidget(self.status)
+
+    def _cancel(self) -> None:
+        self.status.setText("Cancelling...")
+        self.cancelled.emit()
+
+    def closeEvent(self, event):
+        """The window-manager X means the same thing as the button."""
+        self.cancelled.emit()
+        super().closeEvent(event)
 
     def _copy(self) -> None:
         QApplication.clipboard().setText(self.code_field.text())

@@ -501,6 +501,10 @@ class SendRun:
         if plan.rendered.html:
             (directory / f"{stem}.html").write_text(plan.rendered.html, encoding="utf-8")
 
+    def cancel_sign_in(self) -> bool:
+        """Call off a device flow this run is waiting on. Safe from another thread."""
+        return self._mailer.cancel_sign_in() if self._mailer is not None else False
+
     def _sign_in(self, on_device_code) -> None:
         if self._mailer is not None:
             return

@@ -25,7 +25,7 @@ from kasseimail.ui.log_panel import LogPanel
 from kasseimail.ui.recipients_panel import RecipientsPanel
 from kasseimail.ui.send_panel import SendPanel
 from kasseimail.ui.template_panel import TemplatePanel
-from kasseimail.ui.worker import SendController
+from kasseimail.ui.worker import SendController, SignInController
 
 
 class MainWindow(QMainWindow):
@@ -38,6 +38,7 @@ class MainWindow(QMainWindow):
         #    last week deciding whether today's assertion passes.
         self.store = store if store is not None else QSettings("kasseimail", "kasseimail")
         self.controller = SendController(self)
+        self.signin = SignInController(self)
         self.device_dialog = None
         self._last_preflight = None
 
@@ -109,6 +110,10 @@ class MainWindow(QMainWindow):
         self.controller.finished.connect(self._on_finished)
         self.controller.failed.connect(self._on_failed)
         self.controller.stopped.connect(lambda: self.send.set_busy(False))
+
+        self.signin.device_code.connect(self._on_device_code)
+        self.signin.finished.connect(self._on_signed_in)
+        self.signin.failed.connect(self._on_signin_failed)
 
     # -- building a run -------------------------------------------------------------------------
 
@@ -254,17 +259,38 @@ class MainWindow(QMainWindow):
         )
 
     def _on_device_code(self, flow: dict) -> None:
-        """Show the code. The worker thread is waiting on `code_is_showing` for this to happen."""
+        """Show the code, for either worker. Modeless -- the log has to keep moving behind it."""
+        self._close_device_dialog()
+
         self.device_dialog = DeviceCodeDialog(flow, self)
+        self.device_dialog.cancelled.connect(self._cancel_sign_in)
         self.device_dialog.show()
         self.device_dialog.raise_()
-        self.controller.code_is_showing()
 
-    def _on_finished(self, summary) -> None:
+        # -- only the send worker waits to be told; the sign-in worker just polls.
+        if self.controller.busy:
+            self.controller.code_is_showing()
+
+    def _cancel_sign_in(self) -> None:
+        """Whichever worker is waiting on the code, tell it to stop."""
+        self.signin.cancel()
+        self.controller.cancel()
+        self.statusBar().showMessage("Cancelling the sign-in...")
+
+    def _raise_device_dialog(self) -> None:
         if self.device_dialog is not None:
-            self.device_dialog.signed_in()
+            self.device_dialog.show()
+            self.device_dialog.raise_()
+            self.device_dialog.activateWindow()
+
+    def _close_device_dialog(self) -> None:
+        if self.device_dialog is not None:
+            self.device_dialog.hide()
+            self.device_dialog.deleteLater()
             self.device_dialog = None
 
+    def _on_finished(self, summary) -> None:
+        self._close_device_dialog()
         self.send.set_busy(False)
         self.send.set_progress(summary.delivered, max(1, summary.total))
 
@@ -290,10 +316,7 @@ class MainWindow(QMainWindow):
         self._show_account()
 
     def _on_failed(self, message: str) -> None:
-        if self.device_dialog is not None:
-            self.device_dialog.hide()
-            self.device_dialog = None
-
+        self._close_device_dialog()
         self.send.set_busy(False)
         self.send.set_status("failed")
         logger.error(message)
@@ -314,13 +337,26 @@ class MainWindow(QMainWindow):
                            self.settings.token_cache)
 
     def _account_name(self) -> str:
+        """Who is signed in, for the title bar and the confirmation.
+
+        Never raises. This runs from the constructor, before the window is on screen, and an
+        exception there takes the whole application down with nothing to look at -- which is
+        exactly what a mistyped tenant id used to do. The reason goes to the log instead, where
+        it is readable once the window is up.
+        """
         mailer = self._mailer()
         if mailer is None:
             return "(no credentials configured)"
+
         try:
             account = mailer.cached_account()
-        except SignInProblem:
-            return "(not signed in)"
+        except SignInProblem as exc:
+            logger.warning("cannot check the account: {}", str(exc).splitlines()[0])
+            return "(credentials rejected — see Account → Credentials)"
+        except Exception as exc:  # pragma: no cover -- a network stack that is simply absent
+            logger.warning("cannot check the account: {}", exc)
+            return "(cannot reach Microsoft)"
+
         return account.username if account else "(not signed in — you will be asked)"
 
     def _show_account(self) -> None:
@@ -329,37 +365,47 @@ class MainWindow(QMainWindow):
     def _sign_in(self) -> None:
         """Sign in from the menu, so it can be done before a run rather than during one.
 
-        The device flow blocks, so this is the one place the GUI thread does wait -- the dialog is
-        shown first, and the wait is bounded by MSAL's own expiry on the code.
+        **On a worker thread, like everything else that talks to Microsoft.**
+        `acquire_token_by_device_flow` polls until the code is entered or expires -- up to about
+        fifteen minutes. Run here, that is fifteen minutes in which the window does not repaint,
+        which the desktop reports as "not responding" and offers to kill. Worse, pumping the event
+        loop by hand to get the dialog painted lets a close event through, and then the window is
+        torn down while this method is still on the stack holding it.
         """
         mailer = self._mailer()
         if mailer is None:
+            QMessageBox.information(
+                self, "No credentials yet",
+                "Set the tenant and client id of an Entra ID app registration first.",
+            )
             self._edit_credentials()
             return
 
-        def show_code(flow):
-            self.device_dialog = DeviceCodeDialog(flow, self)
-            self.device_dialog.show()
-            self.device_dialog.raise_()
-            # -- paint it before MSAL starts polling and the event loop stops turning.
-            from PySide6.QtWidgets import QApplication
-
-            QApplication.processEvents()
-
-        try:
-            mailer.sign_in(on_device_code=show_code)
-        except SignInProblem as exc:
-            QMessageBox.warning(self, "Could not sign in", str(exc))
+        if self.signin.busy:
+            self._raise_device_dialog()
             return
-        finally:
-            if self.device_dialog is not None:
-                self.device_dialog.hide()
-                self.device_dialog = None
 
+        self.statusBar().showMessage("Signing in...")
+        self.signin.start(mailer)
+
+    def _on_signed_in(self, account) -> None:
+        self._close_device_dialog()
         self._show_account()
-        QMessageBox.information(self, "Signed in", f"Signed in as {self._account_name()}.")
+        name = account.username if account else "(unknown)"
+        self.statusBar().showMessage(f"Signed in as {name}")
+        QMessageBox.information(self, "Signed in", f"Signed in as {name}.")
+
+    def _on_signin_failed(self, message: str) -> None:
+        self._close_device_dialog()
+        self.statusBar().showMessage("Not signed in")
+        logger.error(message)
+        QMessageBox.warning(self, "Could not sign in", message)
 
     def _sign_out(self) -> None:
+        if self.signin.busy:
+            QMessageBox.information(self, "Signing in", "A sign-in is still going. Let it finish.")
+            return
+
         mailer = self._mailer()
         if mailer is not None and mailer.forget():
             logger.info("token cache removed")
@@ -497,6 +543,14 @@ class MainWindow(QMainWindow):
                 return
             self.controller.cancel()
             self.controller.wait()
+
+        # -- a sign-in polls for about fifteen minutes, and destroying a QThread that is still
+        #    running turns a clean exit into an abort. `cancel` is MSAL's own way out of the loop
+        #    and lands on its next poll, so a few seconds is enough to wait for.
+        if self.signin.busy:
+            self.signin.cancel()
+            self.signin.wait(10_000)
+        self._close_device_dialog()
 
         self.templates.commit()
         self._remember()

@@ -328,3 +328,155 @@ def test_pending_edits_are_written_before_a_run_is_built(window):
 
     context = window.recipients.table.rows[0].context()
     assert run.template.render(context).subject == "Edited subject"
+
+
+# -- signing in ------------------------------------------------------------------------------------
+
+class PollingMailer:
+    """A mailer that blocks the way MSAL's device flow does, and stops the same way.
+
+    The real thing polls until the code is entered or expires -- about fifteen minutes -- and
+    checks `flow["expires_at"]` between polls. Both halves matter here: the blocking is what the
+    worker thread exists for, and the check is the only way out of it.
+    """
+
+    def __init__(self, seconds=900):
+        self._flow = None
+        self.thread = None
+        self.seconds = seconds
+
+    def sign_in(self, on_device_code=None, silent_only=False):
+        import threading
+        import time
+
+        self.thread = threading.current_thread()
+        self._flow = {"user_code": "ABCD-1234", "expires_at": time.time() + self.seconds,
+                      "verification_uri": "https://microsoft.com/devicelogin", "message": "go"}
+        on_device_code(self._flow)
+
+        while self._flow.get("expires_at", 0) > time.time():
+            time.sleep(0.02)
+
+        from kasseimail.graph import SignInProblem
+
+        raise SignInProblem("Sign-in was cancelled.")
+
+    def cancel_sign_in(self):
+        if self._flow is None:
+            return False
+        self._flow["expires_at"] = 0
+        return True
+
+    def cached_account(self):
+        return None
+
+
+def pump(qt_app, until, seconds=10):
+    import time
+
+    end = time.time() + seconds
+    while not until() and time.time() < end:
+        qt_app.processEvents()
+        time.sleep(0.005)
+    qt_app.processEvents()
+
+
+def test_signing_in_does_not_block_the_window(window, qt_app, monkeypatch):
+    """`acquire_token_by_device_flow` polls for up to fifteen minutes. Run on the GUI thread that
+    is fifteen minutes without a repaint, which the desktop reports as "not responding" and offers
+    to kill -- and pumping the event loop by hand to get the dialog painted lets a close event
+    through, tearing the window down while the sign-in is still on the stack holding it.
+    """
+    import threading
+
+    mailer = PollingMailer()
+    monkeypatch.setattr(window, "_mailer", lambda: mailer)
+
+    window._sign_in()
+    pump(qt_app, lambda: window.device_dialog is not None)
+
+    assert window.device_dialog is not None, "the code has to be on screen while it polls"
+    assert window.device_dialog.code_field.text() == "ABCD-1234"
+    assert mailer.thread is not threading.main_thread()
+
+    window.signin.cancel()
+    pump(qt_app, lambda: not window.signin.busy)
+
+
+def test_the_window_stays_live_while_a_sign_in_polls(window, qt_app, monkeypatch):
+    """The point of the thread, stated as the thing a person would notice."""
+    from PySide6.QtCore import QTimer
+
+    monkeypatch.setattr(window, "_mailer", lambda: PollingMailer())
+
+    ticks = []
+    heartbeat = QTimer()
+    heartbeat.timeout.connect(lambda: ticks.append(1))
+    heartbeat.start(20)
+
+    window._sign_in()
+    pump(qt_app, lambda: len(ticks) > 10, seconds=5)
+
+    assert len(ticks) > 10, "the event loop stopped turning"
+
+    heartbeat.stop()
+    window.signin.cancel()
+    pump(qt_app, lambda: not window.signin.busy)
+
+
+def test_cancelling_from_the_dialog_stops_the_sign_in(window, qt_app, monkeypatch):
+    """The button says "Cancel sign-in", so it has to mean it. Only hiding the dialog would leave
+    a thread polling for a quarter of an hour with nothing on screen to explain it."""
+    monkeypatch.setattr(window, "_mailer", lambda: PollingMailer())
+
+    window._sign_in()
+    pump(qt_app, lambda: window.device_dialog is not None)
+
+    window.device_dialog._cancel()
+    pump(qt_app, lambda: not window.signin.busy)
+
+    assert not window.signin.busy
+    assert window.device_dialog is None
+
+
+def test_a_second_sign_in_raises_the_dialog_instead_of_starting_another(window, qt_app,
+                                                                       monkeypatch):
+    """Two device codes for one sign-in is two codes that both look right and one that works."""
+    monkeypatch.setattr(window, "_mailer", lambda: PollingMailer())
+
+    window._sign_in()
+    pump(qt_app, lambda: window.device_dialog is not None)
+    first = window.device_dialog
+
+    window._sign_in()
+
+    assert window.device_dialog is first
+
+    window.signin.cancel()
+    pump(qt_app, lambda: not window.signin.busy)
+
+
+def test_credentials_microsoft_rejects_do_not_take_the_window_down(qt_app, template_dir,
+                                                                   make_template, tmp_path,
+                                                                   dialogs, monkeypatch):
+    """The window asks who is signed in from its own constructor. A tenant MSAL will not resolve
+    raises there, and the application used to die before it was ever on screen."""
+    import msal
+    from PySide6.QtCore import QSettings
+
+    make_template("invoice")
+
+    def refuse(*args, **kwargs):
+        raise ValueError("Unable to get authority configuration for ...")
+
+    monkeypatch.setattr(msal, "PublicClientApplication", refuse)
+
+    settings = config.load_settings(template_dir=template_dir)
+    settings.tenant_id, settings.client_id = "not-a-tenant", "client"
+
+    built = MainWindow(settings, store=QSettings(str(tmp_path / "s.ini"), QSettings.IniFormat))
+    try:
+        assert "credentials rejected" in built.windowTitle()
+    finally:
+        built.log.detach()
+        built.close()

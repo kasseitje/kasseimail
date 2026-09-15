@@ -18,6 +18,7 @@ import threading
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from kasseimail.graph import SignInProblem
 from kasseimail.run import RunProblem, SendRun
 
 
@@ -39,6 +40,9 @@ class SendWorker(QObject):
 
     def cancel(self) -> None:
         self._cancel.set()
+        # -- a run that is still waiting on a device code has nothing to interrupt between
+        #    messages, because it has not reached the first one. Stop the polling too.
+        self.run.cancel_sign_in()
 
     def start(self) -> None:
         """The slot the thread's `started` signal is wired to."""
@@ -66,16 +70,47 @@ class SendWorker(QObject):
         self._code_shown.set()
 
 
-class SendController(QObject):
-    """The thread, the worker and their wiring, so the window holds one object instead of three.
+class SignInWorker(QObject):
+    """Signing in, off the GUI thread.
 
-    It keeps references to both: a `QThread` whose Python wrapper is garbage-collected takes the
-    running thread with it, and the crash that follows points at nothing useful.
+    Its own worker rather than a corner of `SendWorker`, because signing in from the menu is a
+    thing you do *before* a run -- and it has to be off the GUI thread for the same reason the run
+    does. `acquire_token_by_device_flow` polls until somebody enters the code, up to about fifteen
+    minutes. On the GUI thread that is fifteen minutes of a window that does not repaint, which the
+    desktop reports as "not responding" and offers to kill.
     """
 
-    progress = Signal(object)
     device_code = Signal(object)
-    finished = Signal(object)
+    finished = Signal(object)      # graph.Account, or None
+    failed = Signal(str)
+
+    def __init__(self, mailer):
+        super().__init__()
+        self.mailer = mailer
+
+    def cancel(self) -> None:
+        """Call off the polling. Takes effect on MSAL's next poll, so within a few seconds."""
+        self.mailer.cancel_sign_in()
+
+    def start(self) -> None:
+        try:
+            self.mailer.sign_in(on_device_code=self.device_code.emit)
+            self.finished.emit(self.mailer.cached_account())
+        except SignInProblem as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # pragma: no cover -- a network that is simply not there
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class ThreadedTask(QObject):
+    """One worker on one `QThread`, with the lifetime handled in a single place.
+
+    Both controllers below need the same five lines and the same two mistakes avoided: a `QThread`
+    whose Python wrapper is garbage-collected takes the running thread with it, and a worker deleted
+    while its thread still runs crashes somewhere that names neither. Having written that twice, it
+    lives here once.
+    """
+
     failed = Signal(str)
     stopped = Signal()
 
@@ -88,39 +123,23 @@ class SendController(QObject):
     def busy(self) -> bool:
         return self._thread is not None and self._thread.isRunning()
 
-    def start(self, run: SendRun) -> None:
+    def _launch(self, worker: QObject) -> None:
         if self.busy:
-            raise RuntimeError("a run is already going")
+            raise RuntimeError("a task is already running")
 
         self._thread = QThread()
-        self._worker = SendWorker(run)
-        self._worker.moveToThread(self._thread)
+        self._worker = worker
+        worker.moveToThread(self._thread)
 
-        self._thread.started.connect(self._worker.start)
-        self._worker.progress.connect(self.progress)
-        self._worker.device_code.connect(self.device_code)
-        self._worker.finished.connect(self._done)
-        self._worker.failed.connect(self._done_with_error)
-
+        self._thread.started.connect(worker.start)
+        worker.failed.connect(self._done_with_error)
         self._thread.start()
 
-    def cancel(self) -> None:
-        if self._worker is not None:
-            self._worker.cancel()
-
-    def code_is_showing(self) -> None:
-        if self._worker is not None:
-            self._worker.code_is_showing()
-
     def wait(self, milliseconds: int = 30_000) -> None:
-        """Let a run in flight finish. Called when the window closes."""
+        """Let work in flight finish. Called when the window closes."""
         if self._thread is not None and self._thread.isRunning():
             self._thread.quit()
             self._thread.wait(milliseconds)
-
-    def _done(self, summary) -> None:
-        self.finished.emit(summary)
-        self._teardown()
 
     def _done_with_error(self, message: str) -> None:
         self.failed.emit(message)
@@ -135,3 +154,51 @@ class SendController(QObject):
             self._worker.deleteLater()
         self._thread = self._worker = None
         self.stopped.emit()
+
+
+class SendController(ThreadedTask):
+    """A `SendRun` on its own thread."""
+
+    progress = Signal(object)
+    device_code = Signal(object)
+    finished = Signal(object)
+
+    def start(self, run: SendRun) -> None:
+        worker = SendWorker(run)
+        worker.progress.connect(self.progress)
+        worker.device_code.connect(self.device_code)
+        worker.finished.connect(self._done)
+        self._launch(worker)
+
+    def cancel(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+
+    def code_is_showing(self) -> None:
+        if self._worker is not None:
+            self._worker.code_is_showing()
+
+    def _done(self, summary) -> None:
+        self.finished.emit(summary)
+        self._teardown()
+
+
+class SignInController(ThreadedTask):
+    """A device-code sign-in on its own thread."""
+
+    device_code = Signal(object)
+    finished = Signal(object)
+
+    def cancel(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+
+    def start(self, mailer) -> None:
+        worker = SignInWorker(mailer)
+        worker.device_code.connect(self.device_code)
+        worker.finished.connect(self._done)
+        self._launch(worker)
+
+    def _done(self, account) -> None:
+        self.finished.emit(account)
+        self._teardown()

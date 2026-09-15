@@ -60,6 +60,12 @@ class GraphMailer:
     """A signed-in connection to one mailbox."""
 
     def __init__(self, tenant_id: str, client_id: str, cache_path: str | Path):
+        # -- stripped, because these arrive by paste. A trailing newline out of a browser or a
+        #    stray quote out of a config file makes MSAL reject the authority URL, and the error
+        #    it gives is about URL formats rather than about the invisible character.
+        tenant_id = (tenant_id or "").strip().strip("\"'")
+        client_id = (client_id or "").strip().strip("\"'")
+
         if not tenant_id or not client_id:
             raise SignInProblem("No tenant id or client id; see `kasseimail config show`.")
 
@@ -72,6 +78,9 @@ class GraphMailer:
         self._token = None
         self._expires_at = 0.0
         self._session = None
+        # -- the in-flight device flow, kept so another thread can call off the polling. See
+        #    `cancel_sign_in`.
+        self._flow = None
 
     # -- signing in ---------------------------------------------------------------------------
 
@@ -90,11 +99,28 @@ class GraphMailer:
                 # -- a truncated cache is a reason to sign in again, not to stop.
                 logger.warning("token cache unreadable ({}); signing in again", exc)
 
-        self._app = msal.PublicClientApplication(
-            self.client_id,
-            authority=f"https://login.microsoftonline.com/{self.tenant_id}",
-            token_cache=self._cache,
-        )
+        # -- MSAL fetches the authority's OpenID configuration here, so this is where a wrong
+        #    tenant id and an unreachable network both first show up -- as a ValueError naming URL
+        #    formats. Left alone it escapes into whatever called us, which in the window is the
+        #    constructor, and the window dies before it is on screen.
+        try:
+            self._app = msal.PublicClientApplication(
+                self.client_id,
+                authority=f"https://login.microsoftonline.com/{self.tenant_id}",
+                token_cache=self._cache,
+            )
+        except ValueError as exc:
+            raise SignInProblem(
+                f"Microsoft would not accept the tenant '{self.tenant_id}'.\n\n"
+                "It has to be the Directory (tenant) ID from the app registration's overview "
+                "page -- a GUID -- or the tenant's domain, like contoso.onmicrosoft.com.\n\n"
+                "If it looks right, check that this machine can reach "
+                "login.microsoftonline.com.\n\n"
+                f"Microsoft said: {exc}"
+            ) from exc
+        except Exception as exc:
+            raise SignInProblem(f"Could not reach Microsoft to sign in: {exc}") from exc
+
         return self._app
 
     def cached_account(self) -> Account | None:
@@ -152,7 +178,29 @@ class GraphMailer:
         else:
             print("\n" + flow["message"] + "\n", flush=True)
 
-        return app.acquire_token_by_device_flow(flow)
+        self._flow = flow
+        try:
+            # -- blocks, polling, until the code is used or expires: about fifteen minutes. The
+            #    caller decides which thread that happens on; in the window it is a worker.
+            return app.acquire_token_by_device_flow(flow)
+        finally:
+            self._flow = None
+
+    def cancel_sign_in(self) -> bool:
+        """Call off a device flow that is polling. Safe to call from another thread.
+
+        Setting `expires_at` to 0 is MSAL's own documented way to abort the loop -- it checks the
+        key between polls. Without it there is no way to stop: closing the window during a sign-in
+        would leave a thread polling for a quarter of an hour, and destroying a running QThread is
+        how a clean exit turns into an abort.
+
+        It takes effect on the next poll, so within about five seconds rather than instantly.
+        """
+        flow = self._flow
+        if flow is None:
+            return False
+        flow["expires_at"] = 0
+        return True
 
     def _remember(self, result: dict) -> None:
         self._token = result["access_token"]
