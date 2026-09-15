@@ -1,0 +1,20 @@
+{# -- The subject. One line; anything after the first is dropped.
+
+      Every column of the spreadsheet is available here by its name, lowercased with spaces turned
+      into underscores: a column headed "First Name" is {{ first_name }}. `kasseimail validate`
+      prints the full list for a given file.
+
+      Besides the columns:
+        row            the row number in the source file, 1-based
+        email          the resolved address for this row
+        attachments    the filenames attached to this message
+
+      Filters:
+        {{ due | date("%d %B %Y") }}   a spreadsheet date, formatted
+        {{ amount | money }}           1234.5  ->  € 1.234,50
+        {{ note | blank }}             an empty cell as "", never "None"
+
+      A name that does not exist is an error, not a blank -- that is deliberate. Seventy mails
+      opening with "Dear ," cannot be taken back; one refusal can.
+-#}
+A message for {{ first_name }}

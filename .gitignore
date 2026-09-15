@@ -1,0 +1,24 @@
+# -- the whole directory, not `out/*.csv`. A run writes rendered bodies, a report and a log there,
+#    and every one of them carries real names and addresses out of somebody's spreadsheet. A
+#    pattern that lists extensions is one new output format away from committing a mailing list.
+out/
+runs/
+
+# -- credentials. `.env` holds the tenant and client id; the token cache holds a refresh token that
+#    lets the bearer send mail as you. Neither may be one `git add -A` away from a public remote.
+.env
+*.token.json
+token.json
+
+# -- sample data. Whatever you point --data at while testing is a real mailing list.
+*.xlsx
+*.xls
+!tests/**/*.xlsx
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+dist/
+build/
+*.egg-info/

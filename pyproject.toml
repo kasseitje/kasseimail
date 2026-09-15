@@ -1,0 +1,44 @@
+[project]
+name = "kasseimail"
+version = "0.1.0"
+description = "Bulk email sender over the Microsoft Graph API, with Jinja2 templates and a spreadsheet of recipients"
+authors = [{ name = "Bino Maiheu", email = "binomaiheu@gmail.com" }]
+requires-python = ">=3.13"
+readme = "README.md"
+dependencies = [
+    "jinja2>=3.1.0",
+    "loguru>=0.7.0",
+    "msal>=1.28",
+    "requests>=2.31",
+    "openpyxl>=3.1.0",
+    "python-dotenv>=1.0.0",
+    "platformdirs>=4.0.0",
+]
+
+[project.scripts]
+kasseimail = "kasseimail.cli:main"
+# -- the same entry point as `kasseimail gui`, for a desktop launcher that cannot pass an argument.
+kasseimail-gui = "kasseimail.ui.app:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+# -- Qt is not a dependency of the CLI. A machine that runs `kasseimail send` from cron has no
+#    display and no business installing 100 MB of widgets; install it with `uv sync --group gui`.
+#    Without the group, `kasseimail gui` refuses to start and says that command -- see
+#    kasseimail.config._require.
+gui = [
+    "pyside6>=6.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kasseimail"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

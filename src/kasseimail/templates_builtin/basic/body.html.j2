@@ -1,0 +1,24 @@
+{#- The HTML body. See subject.j2 for the fields you can use here.
+
+    Everything is in `style=""` attributes and not in a <style> block, and that is not laziness:
+    mail clients -- Outlook above all -- throw away a stylesheet in the <head>, and the mail then
+    arrives as unstyled text. Inline styles survive.
+
+    Values are HTML-escaped here and nowhere else, so a company name with an `&` in it cannot
+    break the markup. -#}
+<div style="font-family:system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+            font-size:15px;line-height:1.5;color:#1c2431;max-width:640px">
+
+  <p>Dear {{ first_name }},</p>
+
+  <p>This is the starter template. Replace this text with yours, in this file and in
+     <code>body.txt.j2</code>.</p>
+
+  {%- if attachments %}
+  <p style="color:#556;font-size:14px">
+    Attached: {{ attachments | join(', ') }}
+  </p>
+  {%- endif %}
+
+  <p style="margin-top:22px">Kind regards,</p>
+</div>

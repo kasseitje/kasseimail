@@ -1,0 +1,19 @@
+# -- What this template carries with it. Everything here is a default: a flag on the command line
+#    wins, and `kasseimail send --help` lists the flags that override each one.
+
+description = "Starter template. Copy it, rename it, make it yours."
+
+# -- Columns that must exist in the spreadsheet, checked before anything is sent. Naming them here
+#    turns "Dear ," in seventy mails into one refusal that names the missing column.
+required = ["email", "first_name"]
+
+# -- Attachment patterns, rendered per row like the body is, then matched on disk. A pattern with
+#    no field in it is simply the same file on every mail. Paths are relative to --attachment-root,
+#    which defaults to the directory the spreadsheet is in.
+#
+# attachments = ["handbook.pdf", "invoices/{{ invoice_no }}.pdf"]
+attachments = []
+
+cc = []
+bcc = []
+reply_to = []
