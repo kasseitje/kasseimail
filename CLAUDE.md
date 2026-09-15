@@ -109,6 +109,41 @@ reason; `kpmail` `print`s the message, which a window cannot use.
 thread logged, and a widget may only be touched from the GUI thread — the queued signal is the
 handover. Never write to the widget from the sink.
 
+## Version and the frozen build
+
+**The version comes from the git tag, through `hatch-vcs`, and from nowhere else.** `pyproject.toml`
+declares it dynamic; there is no literal to drift. `[tool.hatch.build.hooks.vcs]` writes
+`src/kasseimail/_version.py` (generated, gitignored) at install time, and `version.py` reads it
+first, then `importlib.metadata`, then `git describe`.
+
+That order exists for the frozen build: **PyInstaller bundles no package metadata**, so
+`importlib.metadata` finds nothing inside an executable and `_version.py` is the only thing that
+works there. `_from_git` refuses to run when `sys.frozen` is set — the directory an exe was started
+from may be somebody else's repository.
+
+`uv` does not rebuild just because a tag appeared, so `_version.py` goes stale the moment you tag.
+`scripts/build_exe.py` runs `uv sync --reinstall-package kasseimail` before every build for exactly
+that reason; by hand it is the same command.
+
+`kasseimail.spec` builds **two programs from one analysis** — `pyinstaller_entry.py` dispatches on
+`argv[0]`, so `kasseimail-gui.exe` opens the window and `kasseimail.exe` is the CLI, sharing one copy
+of Qt. onedir rather than onefile: a onefile Qt bundle unpacks ~300 MB to temp on every launch.
+
+Three things there are easy to undo by accident:
+
+- `templates_builtin/` is **data**, so nothing in the import graph points at it. `collect_data_files`
+  puts it where `templates.BUILTIN_DIR` looks; without it a frozen build opens on an empty template
+  list.
+- A **windowed build on Windows has no console**, and Python sets `sys.stderr` to `None` there.
+  `logs.setup()` skips its sink in that case — handing `None` to loguru raises, and the window would
+  die before anything was on screen.
+- The Windows version resource takes **four plain integers**, so `version_tuple()` cuts
+  `0.1.0.post1.dev0+g78eb379` down to `(0, 1, 0, 0)`. The full string goes in the text fields beside
+  it.
+
+A Windows `.exe` must be built on Windows; PyInstaller cannot cross-compile. The spec itself is
+platform-neutral, and building on Linux is a decent check that it still works.
+
 ## Testing
 
 `uv run pytest`. Test names are full sentences and each has a docstring naming the failure it

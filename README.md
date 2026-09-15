@@ -210,6 +210,77 @@ out/
     messages/         the rendered bodies, 0007-jan-example-be.html and .txt
 ```
 
+## Building a standalone executable
+
+For a machine with no Python on it. **A Windows `.exe` has to be built on Windows** — PyInstaller
+freezes the interpreter and libraries of the machine it runs on, and there is no cross-compilation.
+Run it on Linux or macOS and you get a working build for that platform instead.
+
+```powershell
+git clone https://github.com/...  &&  cd kasseimail
+uv sync --group dev --group gui
+uv run python scripts/build_exe.py
+```
+
+That produces `dist/kasseimail/` with two programs sharing one copy of Qt, and a zip of it next to
+them:
+
+| | |
+|---|---|
+| `kasseimail.exe` | the command line — a console program, because its output is text |
+| `kasseimail-gui.exe` | the window — no console, so starting it flashes no black box |
+
+Both come out of one PyInstaller analysis and decide what to do from the name they were started
+under, so the bundle carries Qt once rather than twice. `dist\kasseimail\kasseimail-gui.exe` is what
+you put a shortcut to; the whole folder has to travel together.
+
+The build script commits nothing and only writes `build/` and `dist/`. Useful flags:
+
+```powershell
+uv run python scripts/build_exe.py --dirty      # build with uncommitted changes anyway
+uv run python scripts/build_exe.py --no-zip     # leave the folder unpacked
+```
+
+It refuses a dirty working tree by default, because the version it bakes in names a commit that
+would not contain your changes.
+
+To run PyInstaller yourself, the spec works on any platform:
+
+```bash
+uv run pyinstaller kasseimail.spec
+```
+
+**Give it an icon** by dropping a `.ico` at `static/kasseimail.ico` before building — the spec picks
+it up if it is there and builds without one if it is not. Windows caches icons aggressively, so a
+newly built exe may show the old one until you rename it or log out.
+
+Expect roughly 300 MB unpacked and 125 MB zipped. Almost all of it is Qt. The spec excludes the Qt
+modules this does not use (QtWebEngine, Quick/QML, 3D, Multimedia, Charts and the rest) — if a
+future change starts needing one, the build will fail rather than silently ship a broken bundle, and
+the fix is to take that module out of `EXCLUDES` in [`kasseimail.spec`](kasseimail.spec).
+
+UPX compression is deliberately off: it roughly halves the download and is a well-known way to have
+a fresh build quarantined by Windows Defender.
+
+## Versioning
+
+The version comes from the **git tag** and nowhere else, through `hatch-vcs`. There is no literal in
+`pyproject.toml` to drift from it.
+
+```bash
+git tag -a 0.2.0 -m "..."       # bare annotated tags, no `v` prefix
+uv sync --reinstall-package kasseimail
+uv run kasseimail --version
+```
+
+Exactly on a tag you get `0.2.0`; past one, `0.2.0.post1.dev3+g1a2b3c4`, which names the commit. The
+`--reinstall-package` matters: `uv` will not rebuild just because a tag appeared, so without it the
+version stays at whatever the last sync saw. `scripts/build_exe.py` does that step for you before
+every build.
+
+On Windows the version also lands in the exe's **Properties → Details**, so a bug report can name a
+build even when nobody thought to run `--version`.
+
 ## Development
 
 ```bash

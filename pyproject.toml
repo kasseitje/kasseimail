@@ -1,6 +1,6 @@
 [project]
 name = "kasseimail"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Bulk email sender over the Microsoft Graph API, with Jinja2 templates and a spreadsheet of recipients"
 authors = [{ name = "Bino Maiheu", email = "binomaiheu@gmail.com" }]
 requires-python = ">=3.13"
@@ -23,6 +23,8 @@ kasseimail-gui = "kasseimail.ui.app:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    # -- builds the standalone executable; see scripts/build_exe.py and kasseimail.spec.
+    "pyinstaller>=6.10",
 ]
 
 # -- Qt is not a dependency of the CLI. A machine that runs `kasseimail send` from cron has no
@@ -34,8 +36,25 @@ gui = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+# -- the version comes from the git tag and nowhere else, so a build can never claim a number
+#    that was never released. Bare annotated tags, no `v` prefix: `git tag -a 0.2.0 -m "..."`.
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+# -- past a tag, the default scheme guesses the *next* version, so a build off 0.1.0 would call
+#    itself 0.2.0.dev1 and claim a release that does not exist. no-guess-dev stays anchored to the
+#    tag actually reached: 0.1.0.post1.dev2.
+version_scheme = "no-guess-dev"
+
+# -- written into the package at build time, and the only way a frozen executable can know its own
+#    version: PyInstaller bundles no package metadata, so `importlib.metadata` finds nothing there.
+#    Generated, therefore gitignored -- `kasseimail/version.py` reads it.
+[tool.hatch.build.hooks.vcs]
+version-file = "src/kasseimail/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kasseimail"]

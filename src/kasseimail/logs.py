@@ -30,12 +30,20 @@ def setup(verbose: bool = False, quiet: bool = False) -> None:
 
     stderr and not stdout, so a run whose output is piped somewhere keeps the progress lines on the
     terminal and the piped stream clean.
+
+    **There may be no stderr at all.** A windowed PyInstaller build on Windows has no console, and
+    Python sets `sys.stderr` to `None` there -- handing that to loguru raises, so the window would
+    die on its very first line of setup. The GUI adds its own sink and shows the same lines in the
+    log pane, so there is nothing to lose by skipping this one.
     """
     logger.remove()
     if quiet:
         level = "WARNING"
     else:
         level = "DEBUG" if verbose else "INFO"
+
+    if sys.stderr is None:
+        return
 
     logger.add(sys.stderr, format=CONSOLE_FORMAT, level=level, colorize=True, enqueue=False)
 

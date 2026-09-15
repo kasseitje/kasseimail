@@ -117,3 +117,34 @@ def test_the_wheel_is_told_where_the_package_is():
     """A src layout that hatchling is not told about builds an empty wheel."""
     assert pyproject()["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == \
         ["src/kasseimail"]
+
+
+# -- a frozen build has no console ------------------------------------------------------------------
+
+def test_logging_setup_survives_having_no_stderr(monkeypatch):
+    """A windowed PyInstaller build on Windows has no console, and Python sets `sys.stderr` to
+    None there. Handing that to loguru raises, so the window would die on its first line of setup
+    -- before anything is on screen to say why."""
+    from kasseimail import logs
+
+    monkeypatch.setattr(logs.sys, "stderr", None)
+
+    logs.setup()          # must not raise
+
+    from loguru import logger
+
+    logger.info("nowhere to write this, and that is fine")
+
+
+def test_logging_setup_still_adds_a_sink_when_there_is_a_console(monkeypatch, capsys):
+    """The other half: the guard must not quietly disable logging everywhere else."""
+    from kasseimail import logs
+
+    logs.setup()
+    logger_lines = "kasseimail test line"
+
+    from loguru import logger
+
+    logger.info(logger_lines)
+
+    assert logger_lines in capsys.readouterr().err
