@@ -15,11 +15,17 @@ shared variable:
 """
 
 import threading
+import time
 
 from PySide6.QtCore import QObject, QThread, Signal
 
 from kasseimail.graph import SignInProblem
 from kasseimail.run import RunProblem, SendRun
+
+#: how long a worker waits for the GUI thread to put the device code on screen before carrying on
+#: without it. A ceiling rather than a wait forever: if the dialog never appears the run should end
+#: with a sign-in error rather than a thread nobody can reach.
+CODE_DIALOG_TIMEOUT = 10.0
 
 
 class SendWorker(QObject):
@@ -59,12 +65,20 @@ class SendWorker(QObject):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
     def _on_device_code(self, flow: dict) -> None:
-        """Ask the GUI thread to show the code, then let MSAL block waiting for it."""
+        """Ask the GUI thread to show the code, then let MSAL block waiting for it.
+
+        Waited in slices, watching for a cancel. The GUI thread is what sets `_code_shown`, and a
+        window that is closing may never get round to it -- a flat ten-second wait then holds the
+        close open for ten seconds over a dialog nobody is going to look at.
+        """
         self._code_shown.clear()
         self.device_code.emit(flow)
-        # -- a ceiling rather than a wait forever: if the dialog never appears, the run should end
-        #    with a sign-in error instead of a thread nobody can reach.
-        self._code_shown.wait(timeout=10)
+
+        deadline = time.monotonic() + CODE_DIALOG_TIMEOUT
+        while not self._code_shown.is_set() and not self._cancel.is_set():
+            if time.monotonic() >= deadline:
+                break
+            self._code_shown.wait(timeout=0.05)
 
     def code_is_showing(self) -> None:
         self._code_shown.set()
@@ -102,6 +116,15 @@ class SignInWorker(QObject):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+#: threads that would not stop in time, kept alive on purpose.
+#:
+#: A `QThread` destroyed while it is still running aborts the process -- Qt says so and means it.
+#: When a worker is wedged in a socket read there is nothing to interrupt, so the choice is between
+#: aborting on the way out and leaking a thread that the process exit will take with it anyway.
+#: Leaking is the one that does not look like a crash to the person closing the window.
+_ORPHANED: list[tuple] = []
+
+
 class ThreadedTask(QObject):
     """One worker on one `QThread`, with the lifetime handled in a single place.
 
@@ -135,11 +158,36 @@ class ThreadedTask(QObject):
         worker.failed.connect(self._done_with_error)
         self._thread.start()
 
-    def wait(self, milliseconds: int = 30_000) -> None:
-        """Let work in flight finish. Called when the window closes."""
+    def wait(self, milliseconds: int = 10_000) -> bool:
+        """Block until the worker stops. Returns whether it did.
+
+        **Not for the GUI thread.** `quit()` only ends the thread's event loop and does nothing to
+        a slot that is still running, so this is a plain block with no repaints and no events for
+        however long the worker takes -- which is exactly what a frozen window is. The window
+        closes through `detach` and a signal instead; this is for tests and for the CLI.
+        """
+        if self._thread is None or not self._thread.isRunning():
+            return True
+
+        self._thread.quit()
+        return bool(self._thread.wait(milliseconds))
+
+    def detach(self) -> None:
+        """Let go of a worker that has not stopped, without destroying a running QThread.
+
+        The window is closing and something -- a socket that will not time out for another two
+        minutes -- is still going. Dropping the last reference here would destroy a running
+        QThread and abort; keeping it in `_ORPHANED` costs a thread until the process exits, which
+        is about to happen anyway.
+        """
         if self._thread is not None and self._thread.isRunning():
             self._thread.quit()
-            self._thread.wait(milliseconds)
+            _ORPHANED.append((self._thread, self._worker))
+            self._thread = self._worker = None
+            self.stopped.emit()
+            return
+
+        self._teardown()
 
     def _done_with_error(self, message: str) -> None:
         self.failed.emit(message)
@@ -148,7 +196,14 @@ class ThreadedTask(QObject):
     def _teardown(self) -> None:
         if self._thread is not None:
             self._thread.quit()
-            self._thread.wait(5000)
+            # -- short: this runs on the GUI thread, and by the time the worker has emitted the
+            #    signal that got us here its slot has returned and only the event loop is left to
+            #    unwind. A worker that somehow has not finished is orphaned rather than waited on.
+            if not self._thread.wait(2000):
+                _ORPHANED.append((self._thread, self._worker))
+                self._thread = self._worker = None
+                self.stopped.emit()
+                return
             self._thread.deleteLater()
         if self._worker is not None:
             self._worker.deleteLater()

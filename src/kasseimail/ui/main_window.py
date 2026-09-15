@@ -9,7 +9,7 @@ sending something nobody confirmed.
 from pathlib import Path
 
 from loguru import logger
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtWidgets import (
     QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QSplitter, QVBoxLayout, QWidget,
@@ -41,6 +41,8 @@ class MainWindow(QMainWindow):
         self.signin = SignInController(self)
         self.device_dialog = None
         self._last_preflight = None
+        #: set once the window has been asked to close and is waiting for a worker to stop.
+        self._stopping = False
 
         self.setWindowTitle("kasseimail")
         self._build()
@@ -117,6 +119,10 @@ class MainWindow(QMainWindow):
         self.signin.device_code.connect(self._on_device_code)
         self.signin.finished.connect(self._on_signed_in)
         self.signin.failed.connect(self._on_signin_failed)
+
+        # -- a close that is waiting on a worker finishes here, when the worker says it is done.
+        self.controller.stopped.connect(self._close_if_idle)
+        self.signin.stopped.connect(self._close_if_idle)
 
     def _preview_row(self, recipient) -> None:
         position, total = self.recipients.position()
@@ -319,6 +325,12 @@ class MainWindow(QMainWindow):
         self.send.set_status(headline)
         self.statusBar().showMessage(headline)
 
+        # -- a modal box popping up on a window that is already closing is a dialog nobody asked
+        #    for, in front of a window that is going away, holding the close open until it is
+        #    dismissed. The same words are in the log and the report.
+        if self._stopping:
+            return
+
         if summary.failed:
             QMessageBox.warning(
                 self, "Finished with failures",
@@ -341,6 +353,9 @@ class MainWindow(QMainWindow):
         self.send.set_busy(False)
         self.send.set_status("failed")
         logger.error(message)
+
+        if self._stopping:
+            return
         QMessageBox.critical(self, "The run stopped", message)
 
     def _clear_preflight(self) -> None:
@@ -414,12 +429,19 @@ class MainWindow(QMainWindow):
         self._show_account()
         name = account.username if account else "(unknown)"
         self.statusBar().showMessage(f"Signed in as {name}")
+
+        if self._stopping:
+            return
         QMessageBox.information(self, "Signed in", f"Signed in as {name}.")
 
     def _on_signin_failed(self, message: str) -> None:
         self._close_device_dialog()
         self.statusBar().showMessage("Not signed in")
         logger.error(message)
+
+        # -- cancelling a sign-in to close the window is not a failure to report back about.
+        if self._stopping:
+            return
         QMessageBox.warning(self, "Could not sign in", message)
 
     def _sign_out(self) -> None:
@@ -547,33 +569,97 @@ class MainWindow(QMainWindow):
         self.store.setValue("column", self.send.column_field.text())
         self.store.setValue("pause", self.send.pause.value())
 
-    def closeEvent(self, event) -> None:
-        """A run in flight is a reason to ask, not to stop.
+    #: how long a close waits for a worker to stop before giving up on it. Past this the thread is
+    #: orphaned rather than killed -- see `ThreadedTask.detach`. Generous enough for a message in
+    #: flight and short enough that nobody thinks the window has hung.
+    STOP_TIMEOUT_MS = 20_000
 
-        Closing the window mid-run would cut the thread off between two messages, leaving the
-        report short of what actually went out -- and that report is what a resumed run reads.
+    def closeEvent(self, event) -> None:
+        """A run in flight is a reason to ask, then to wait -- but never to block.
+
+        **The window does not freeze while it waits.** The obvious version of this calls
+        `QThread.wait()` here, and that is a plain block on the GUI thread: no repaints, no events,
+        for as long as the worker takes. A message in flight plus a throttling pause is easily ten
+        seconds of a window that the desktop starts offering to kill, which is exactly what it
+        looks like when it is doing the right thing.
+
+        So the close is *deferred* instead. The event is refused, the workers are told to stop, the
+        window says so, and `_close_if_idle` closes it for real when they have. A worker wedged in
+        a socket read is given `STOP_TIMEOUT_MS` and then let go of.
         """
-        if self.controller.busy:
-            answer = QMessageBox.question(
-                self, "A run is going",
-                "Messages are still being sent. Stop after the current one and close?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
+        if self.controller.busy or self.signin.busy:
+            if not self._stopping and not self._confirm_stop():
                 event.ignore()
                 return
-            self.controller.cancel()
-            self.controller.wait()
 
-        # -- a sign-in polls for about fifteen minutes, and destroying a QThread that is still
-        #    running turns a clean exit into an abort. `cancel` is MSAL's own way out of the loop
-        #    and lands on its next poll, so a few seconds is enough to wait for.
-        if self.signin.busy:
-            self.signin.cancel()
-            self.signin.wait(10_000)
+            self._begin_stopping()
+            event.ignore()
+            return
+
+        # -- belt and braces before the window and its controllers are destroyed: anything still
+        #    running here would be a QThread destroyed mid-flight, which aborts the process.
+        self.controller.detach()
+        self.signin.detach()
+
         self._close_device_dialog()
-
         self.templates.commit()
         self._remember()
         self.log.detach()
         super().closeEvent(event)
+
+    def _confirm_stop(self) -> bool:
+        """Ask before abandoning a run. Only a send or drafts run is worth asking about.
+
+        Cutting a run off mid-series leaves the report short of what actually went out, and that
+        report is what a resumed run reads -- so the question is worth one click.
+        """
+        if not self.controller.busy:
+            return True
+
+        answer = QMessageBox.question(
+            self, "A run is going",
+            "Messages are still going out. Stop after the current one and close?\n\n"
+            "What has already been sent stays in the report, so ticking Resume and running "
+            "again continues from there.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes
+
+    def _begin_stopping(self) -> None:
+        self._stopping = True
+
+        self.controller.cancel()
+        self.signin.cancel()
+        self._close_device_dialog()
+
+        self.send.set_status("stopping after the current message...")
+        self.statusBar().showMessage("Stopping — the window closes as soon as the run has stopped")
+        logger.info("closing: waiting for the current message to finish")
+
+        # -- the backstop. A socket read that will not return for another two minutes cannot be
+        #    interrupted, and a window that will not close is worse than a leaked thread.
+        QTimer.singleShot(self.STOP_TIMEOUT_MS, self._force_close)
+
+    def _close_if_idle(self) -> None:
+        """A worker reported it has stopped. If that was the last one, finish closing."""
+        if not self._stopping:
+            return
+        if self.controller.busy or self.signin.busy:
+            return
+        self.close()
+
+    def _force_close(self) -> None:
+        """The deadline passed. Let go of whatever is still running and close anyway.
+
+        Guarded on `_stopping` rather than on whether the window looks visible: a window part-way
+        through closing is not reliably either, and a backstop that skips itself is no backstop.
+        """
+        if not self._stopping:
+            return
+
+        if self.controller.busy or self.signin.busy:
+            logger.warning("a worker did not stop in time; letting go of it and closing")
+            self.controller.detach()
+            self.signin.detach()
+
+        self.close()

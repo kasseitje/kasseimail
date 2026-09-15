@@ -170,3 +170,55 @@ class FakeMailer:
 @pytest.fixture
 def fake_mailer():
     return FakeMailer
+
+
+# ---------------------------------------------------------------------------------------------
+# Qt
+# ---------------------------------------------------------------------------------------------
+#
+# Shared by every GUI module. The Qt imports are inside the fixtures on purpose: this file is
+# collected on a machine with no `gui` group installed, where those modules skip themselves and
+# these fixtures are simply never asked for.
+
+@pytest.fixture(scope="session")
+def qt_app():
+    """One QApplication for the session -- Qt refuses a second one in the same process.
+
+    Built through `ui.app.build_application` rather than directly, because constructing a
+    QApplication changes the C locale for the whole process and every later test would then render
+    dates in the desktop's language. That is the product's own trap, and a fixture that sidestepped
+    the fix would reintroduce it across the suite.
+    """
+    from kasseimail.ui.app import build_application
+
+    yield build_application()
+
+
+@pytest.fixture
+def dialogs(monkeypatch):
+    """Record what a message box would have said instead of showing it.
+
+    Two reasons. A modal dialog blocks the thread the test is pumping events on, so a run that
+    ends in one would hang the suite forever -- which is the very failure the freeze tests are
+    about. And a dialog that was *raised* is often the thing worth asserting: a confirmation
+    before sending is a feature, not a side effect.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    shown = []
+
+    def record(kind, answer=QMessageBox.Yes):
+        def fake(_parent, title, text, *args, **kwargs):
+            shown.append((kind, title, text))
+            return answer
+
+        return fake
+
+    for name in ("information", "warning", "critical", "question", "about"):
+        monkeypatch.setattr(QMessageBox, name, staticmethod(record(name)))
+
+    # -- the send confirmation builds a QMessageBox rather than calling a static method.
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: shown.append(
+        ("confirm", self.windowTitle(), self.text())) or QMessageBox.Yes)
+
+    return shown

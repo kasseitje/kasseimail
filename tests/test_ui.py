@@ -27,43 +27,6 @@ from kasseimail.ui.main_window import MainWindow  # noqa: E402
 from kasseimail.ui.recipients_panel import RecipientModel  # noqa: E402
 
 
-@pytest.fixture(scope="session")
-def qt_app():
-    """One QApplication for the session -- Qt refuses a second one in the same process."""
-    app = QApplication.instance() or QApplication([])
-    app.setStyle("Fusion")
-    yield app
-
-
-@pytest.fixture
-def dialogs(monkeypatch):
-    """Record what a message box would have said instead of showing it.
-
-    Two reasons. A modal dialog blocks the thread the test is pumping events on, so a run that
-    ends in one would hang the suite forever. And a dialog that was *raised* is often the thing
-    worth asserting -- a confirmation before sending is a feature, not a side effect.
-    """
-    from PySide6.QtWidgets import QMessageBox
-
-    shown = []
-
-    def record(kind, answer=QMessageBox.Yes):
-        def fake(_parent, title, text, *args, **kwargs):
-            shown.append((kind, title, text))
-            return answer
-
-        return fake
-
-    for name in ("information", "warning", "critical", "question", "about"):
-        monkeypatch.setattr(QMessageBox, name, staticmethod(record(name)))
-
-    # -- the send confirmation builds a QMessageBox rather than calling a static method.
-    monkeypatch.setattr(QMessageBox, "exec", lambda self: shown.append(
-        ("confirm", self.windowTitle(), self.text())) or QMessageBox.Yes)
-
-    return shown
-
-
 @pytest.fixture
 def window(qt_app, dialogs, template_dir, make_template, people, tmp_path):
     from PySide6.QtCore import QSettings

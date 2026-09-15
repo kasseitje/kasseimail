@@ -76,10 +76,17 @@ household shares a mailbox and each member gets their own mail — so keying on 
 resumed run treats the second person as already done and they never get theirs, silently. The cost
 is that editing the spreadsheet between a run and its resume shifts the row numbers.
 
-**Qt changes the C locale.** Constructing a `QApplication` calls `setlocale(LC_ALL, "")`, and
-`{{ due | date("%d %B %Y") }}` goes through `strftime` — so the same template would render
-"01 March 2026" from the CLI and "01 maart 2026" from the window. `ui/app.py` restores the locale
-straight after. If you ever construct the `QApplication` somewhere else, do the same.
+**Never let `strftime` pick month names.** The process locale is not ours to rely on:
+constructing a `QApplication` calls `setlocale(LC_ALL, "")`, and something in the GUI stack changes
+it again later, at a moment nothing controls — the same template then renders "01 March 2026" from
+the CLI and "01 maart 2026" from the window, on the same machine. `templates.MONTH_NAMES` /
+`DAY_NAMES` hold the names and `_format_date` substitutes `%B %b %A %a` (and the locale-dependent
+aggregates `%c %x %X`) before strftime ever sees them; the language is a filter argument. Everything
+numeric is still strftime's job.
+
+`ui/app.build_application` also restores the locale after constructing the QApplication, and every
+QApplication in the project — the test fixture included — goes through it. That is belt and braces
+now rather than the fix: the fix is that rendering does not read the locale.
 
 **Qt is an optional dependency**, in the `gui` group behind `config.require()`, which uses
 `find_spec` rather than `import` because importing PySide6 costs about a second and the guard runs
@@ -172,6 +179,32 @@ Three things there are easy to undo by accident:
 
 A Windows `.exe` must be built on Windows; PyInstaller cannot cross-compile. The spec itself is
 platform-neutral, and building on Linux is a decent check that it still works.
+
+## Freezing
+
+**The GUI thread never waits on a worker.** `QThread.wait()` there is a plain block -- no repaints,
+no events -- and `quit()` does nothing to a slot that is still running, so it waits out whatever the
+worker is doing. A message in flight plus a throttling pause was easily ten seconds of a window the
+desktop offers to kill.
+
+So closing is *deferred*: `closeEvent` refuses the event, cancels the workers, says so on screen, and
+`_close_if_idle` closes for real when they report they have stopped. `STOP_TIMEOUT_MS` is the
+backstop for a worker wedged in a socket read; past it the thread is **orphaned into
+`worker._ORPHANED` rather than dropped**, because destroying a running QThread aborts the process,
+and `ui/app.run_gui` then `os._exit`s rather than abort during interpreter shutdown.
+
+Everything a worker waits on is sliced so a cancel lands during it, not after:
+
+- `run.interruptible_sleep` for the pause between messages -- the default 2.5s, and far more when
+  somebody is careful about throttling.
+- the same for Graph's `Retry-After`, which can be minutes.
+- `SendWorker._on_device_code` watching `_cancel` while it waits for the dialog.
+
+And no result dialog is raised while `_stopping`: a modal box on a window that is already going away
+holds the close open until somebody dismisses it.
+
+`tests/test_freezing.py` measures the *longest stretch in which the event loop did not turn*, not
+whether a call returned quickly -- a blocking `wait()` returns eventually too.
 
 ## Testing
 

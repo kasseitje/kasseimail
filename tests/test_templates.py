@@ -4,6 +4,8 @@ A template that raises is a template somebody fixes. What is pinned here is the 
 body that renders fine and carries the wrong thing into a mailbox.
 """
 
+import datetime
+
 import pytest
 
 from kasseimail.templates import Template, TemplateProblem, TemplateSet
@@ -114,6 +116,60 @@ def test_the_date_filter_formats_a_spreadsheet_datetime(make_template):
 
     assert "01 March 2026" in rendered.html
     assert "00:00:00" not in rendered.html
+
+
+@pytest.mark.parametrize("where", ["C", "nl_BE.UTF-8", "fr_FR.UTF-8"])
+def test_a_date_renders_the_same_whatever_the_process_locale_is(make_template, where):
+    """**The bug this is really about.** `strftime("%B")` reads the process locale, and that is
+    not ours to rely on: constructing a QApplication calls `setlocale(LC_ALL, "")`, and so does
+    anything else in a large GUI stack that feels like it -- at a moment nobody controls. The same
+    template then renders "01 March 2026" from the command line and "01 maart 2026" from the
+    window, on the same machine, from the same file.
+    """
+    import locale
+
+    template = make_template(html='<p>{{ due | date("%d %B %Y") }}</p>\n')
+
+    previous = locale.setlocale(locale.LC_ALL)
+    try:
+        try:
+            locale.setlocale(locale.LC_ALL, where)
+        except locale.Error:
+            pytest.skip(f"{where} is not installed here")
+
+        rendered = template.render({"due": datetime.datetime(2026, 3, 1)})
+    finally:
+        locale.setlocale(locale.LC_ALL, previous)
+
+    assert "01 March 2026" in rendered.html
+
+
+def test_the_language_of_a_date_is_chosen_in_the_template(make_template):
+    """Taking it from the machine would mean a mail that reads differently depending on who ran
+    it, which for a tool whose whole output is text is not a detail."""
+    template = make_template(
+        html='<p>{{ due | date("%d %B %Y", "nl") }} / {{ due | date("%A", "fr") }}</p>\n')
+
+    rendered = template.render({"due": datetime.datetime(2026, 3, 1)})
+
+    assert "01 maart 2026" in rendered.html
+    assert "dimanche" in rendered.html
+
+
+def test_an_unknown_date_language_falls_back_rather_than_failing(make_template):
+    """A typo in the language should not stop a run of seventy mails."""
+    template = make_template(html='<p>{{ due | date("%B", "kl") }}</p>\n')
+
+    assert "March" in template.render({"due": datetime.datetime(2026, 3, 1)}).html
+
+
+def test_the_numeric_parts_of_a_date_still_come_from_strftime(make_template):
+    """Only the names are substituted; everything else is strftime's job and stays its job."""
+    template = make_template(html='<p>{{ due | date("%Y-%m-%d %H:%M") }}</p>\n')
+
+    rendered = template.render({"due": datetime.datetime(2026, 3, 1, 14, 30)})
+
+    assert "2026-03-01 14:30" in rendered.html
 
 
 def test_the_date_filter_passes_text_through_unchanged(make_template):

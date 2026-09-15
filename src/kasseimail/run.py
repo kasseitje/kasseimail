@@ -376,6 +376,10 @@ class SendRun:
 
         if self.mode != MODE_DRY_RUN:
             self._sign_in(on_device_code)
+            # -- so Graph stops waiting out a Retry-After when the run is called off. A throttled
+            #    run can be told to wait minutes, and that wait is otherwise invisible to cancel.
+            if self._mailer is not None:
+                self._mailer.should_cancel = should_cancel
 
         work = [plan for plan in found.rows if plan.ok]
         summary.total = len(work)
@@ -409,7 +413,7 @@ class SendRun:
             entries.append(entry)
 
             if self.pause and self.mode != MODE_DRY_RUN and index < len(work):
-                time.sleep(self.pause)
+                interruptible_sleep(self.pause, should_cancel)
 
         summary.report = ledger.append(self.out_dir, entries)
         for level, text in summary.summary_lines():
@@ -520,6 +524,25 @@ class SendRun:
         account = self._mailer.cached_account()
         if account:
             logger.info("signed in as {}", account.username)
+
+
+def interruptible_sleep(seconds: float, should_cancel=None, slice_seconds: float = 0.1) -> bool:
+    """Wait, but notice a cancel while waiting. Returns False if it was cut short.
+
+    A plain `time.sleep` of the pause cannot be interrupted, and the pause is where a run spends
+    most of its time -- 2.5 seconds by default, and far more when somebody is being careful about
+    throttling. Cancel then appears to do nothing until it happens to end, and closing the window
+    waits exactly as long with the window frozen.
+    """
+    deadline = time.monotonic() + max(0.0, seconds)
+
+    while True:
+        if should_cancel is not None and should_cancel():
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        time.sleep(min(slice_seconds, remaining))
 
 
 def _merge(from_meta: list[str], from_flags: list[str] | None) -> list[str]:

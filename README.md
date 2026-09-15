@@ -95,6 +95,10 @@ address the mail is actually going to) and `attachments` (the filenames attached
 Three filters exist for spreadsheet data: `{{ due | date("%d %B %Y") }}`, `{{ amount | money }}`
 and `{{ note | blank }}`.
 
+Month and day names are **not** taken from the machine's locale — they are written into the tool, so
+the same template produces the same text wherever it runs. Pick the language in the template:
+`{{ due | date("%d %B %Y", "nl") }}` gives *01 maart 2026*. English, Dutch and French are built in.
+
 **A name that does not exist is an error, not a blank.** `{{ frist_name }}` stops the run instead of
 sending seventy mails opening with *"Dear ,"*. That is what `kasseimail validate` is for — it
 renders every row and touches no network.

@@ -63,16 +63,72 @@ def _autoescape(template_name: str | None) -> bool:
     return bool(template_name) and template_name.endswith((".html.j2", ".html"))
 
 
-def _format_date(value, fmt: str = "%d/%m/%Y") -> str:
+#: month and day names, written out rather than taken from the C library.
+#:
+#: **`strftime("%B")` is not safe here.** It reads the process locale, and the process locale is not
+#: ours to rely on: constructing a QApplication calls `setlocale(LC_ALL, "")`, and so does anything
+#: else in a large GUI stack that feels like it. The same template then renders "01 March 2026" from
+#: the command line and "01 maart 2026" from the window, on the same machine, from the same file --
+#: and the difference only surfaces when a recipient points at it.
+#:
+#: So the names live here, the language is chosen in the template, and the output is the same
+#: everywhere regardless of what any library did to the locale.
+MONTH_NAMES = {
+    "en": ["January", "February", "March", "April", "May", "June",
+           "July", "August", "September", "October", "November", "December"],
+    "nl": ["januari", "februari", "maart", "april", "mei", "juni",
+           "juli", "augustus", "september", "oktober", "november", "december"],
+    "fr": ["janvier", "février", "mars", "avril", "mai", "juin",
+           "juillet", "août", "septembre", "octobre", "novembre", "décembre"],
+}
+
+DAY_NAMES = {
+    "en": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+    "nl": ["maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag"],
+    "fr": ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"],
+}
+
+DEFAULT_DATE_LANGUAGE = "en"
+
+
+def _format_date(value, fmt: str = "%d/%m/%Y", language: str = DEFAULT_DATE_LANGUAGE) -> str:
     """`{{ due | date("%d %B %Y") }}` -- because a spreadsheet date arrives as a datetime.
 
     openpyxl hands back real `datetime` objects, and `{{ due }}` on one of those renders
     `2026-03-01 00:00:00` into a customer's mail. Passing anything else straight through keeps the
     filter usable on a column that is text in one file and a date in the next.
+
+    `{{ due | date("%d %B %Y", "nl") }}` writes the month in Dutch. The names come from the table
+    above rather than from the locale, so the same template gives the same text from the CLI and
+    from the window -- see MONTH_NAMES for why that is not a given.
     """
-    if isinstance(value, (datetime, date)):
-        return value.strftime(fmt)
-    return "" if value is None else str(value)
+    if not isinstance(value, (datetime, date)):
+        return "" if value is None else str(value)
+
+    months = MONTH_NAMES.get(language, MONTH_NAMES[DEFAULT_DATE_LANGUAGE])
+    days = DAY_NAMES.get(language, DAY_NAMES[DEFAULT_DATE_LANGUAGE])
+
+    month, weekday = months[value.month - 1], days[value.weekday()]
+
+    # -- substituted before strftime sees them, and through a placeholder so a month name
+    #    containing a literal % cannot be read as another code.
+    replacements = {
+        "%B": month, "%b": month[:3], "%A": weekday, "%a": weekday[:3],
+        # -- locale-dependent aggregates, which would drag the names back in.
+        "%c": "%Y-%m-%d %H:%M:%S", "%x": "%d/%m/%Y", "%X": "%H:%M:%S",
+    }
+
+    pieces, index = [], 0
+    while index < len(fmt):
+        token = fmt[index:index + 2]
+        if token in replacements:
+            pieces.append(replacements[token])
+            index += 2
+        else:
+            pieces.append(fmt[index])
+            index += 1
+
+    return value.strftime("".join(pieces))
 
 
 def _format_money(value, symbol: str = "€", decimals: int = 2) -> str:

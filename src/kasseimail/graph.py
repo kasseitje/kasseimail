@@ -81,6 +81,8 @@ class GraphMailer:
         # -- the in-flight device flow, kept so another thread can call off the polling. See
         #    `cancel_sign_in`.
         self._flow = None
+        #: set by a run so that waiting out a 429 can be given up on. Graph can ask for minutes.
+        self.should_cancel = None
 
     # -- signing in ---------------------------------------------------------------------------
 
@@ -267,7 +269,14 @@ class GraphMailer:
 
             wait = float(response.headers.get("Retry-After", 2 ** attempt * 5))
             logger.warning("throttled by Graph, waiting {:.0f}s", wait)
-            time.sleep(wait)
+
+            # -- sliced, so a cancel lands during the wait rather than after it. Graph is entitled
+            #    to ask for several minutes, and that is otherwise several minutes in which the
+            #    Cancel button and the window's close box both appear to do nothing.
+            from kasseimail.run import interruptible_sleep
+
+            if not interruptible_sleep(wait, self.should_cancel):
+                raise GraphProblem("cancelled while waiting out Graph's throttling")
 
         if response.status_code >= 400:
             raise GraphProblem(f"Graph {response.status_code}: {_graph_error(response)}")
