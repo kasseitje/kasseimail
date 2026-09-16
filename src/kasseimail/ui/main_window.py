@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from kasseimail import config
-from kasseimail.graph import GraphMailer, SignInProblem
+from kasseimail.graph import GraphMailer, SignInProblem, describe_sender
 from kasseimail.ledger import MODE_DRAFTS, MODE_DRY_RUN, MODE_SEND
 from kasseimail.run import RunProblem, SendRun
 from kasseimail.templates import TemplateProblem
@@ -109,6 +109,9 @@ class MainWindow(QMainWindow):
         self.send.validate_requested.connect(self._validate)
         self.send.run_requested.connect(self._run)
         self.send.cancel_requested.connect(self._cancel)
+        # -- so the title keeps naming the mailbox that would actually be used. `editingFinished`
+        #    rather than `textChanged`: the title should not flicker through half an address.
+        self.send.mailbox_field.editingFinished.connect(self._show_account)
 
         self.controller.progress.connect(self._on_progress)
         self.controller.device_code.connect(self._on_device_code)
@@ -263,7 +266,7 @@ class MainWindow(QMainWindow):
         box.setInformativeText(
             f"Template:    {run.template.name}\n"
             f"Recipients:  {where}\n"
-            f"From:        {self._account_name()}\n"
+            f"From:        {self._sender_name(run.mailbox)}\n"
             + (f"Cc/Bcc:      {', '.join(run.cc + run.bcc)}\n" if (run.cc or run.bcc) else "")
             + ("\nSent mail cannot be recalled." if mode == MODE_SEND else "")
         )
@@ -367,10 +370,17 @@ class MainWindow(QMainWindow):
     # -- the account ----------------------------------------------------------------------------
 
     def _mailer(self) -> GraphMailer | None:
+        """The mailer the menu uses -- to sign in, to sign out, and to ask who is signed in.
+
+        Built with the mailbox in the Send-from box rather than the configured one, because the
+        point of signing in from the menu is to get the device code over with before a run: the
+        permissions asked for have to be the ones that run will need. This mailer never sends
+        anything; a run builds its own.
+        """
         if not (self.settings.tenant_id and self.settings.client_id):
             return None
         return GraphMailer(self.settings.tenant_id, self.settings.client_id,
-                           self.settings.token_cache)
+                           self.settings.token_cache, mailbox=self._sending_mailbox())
 
     def _account_name(self) -> str:
         """Who is signed in, for the title bar and the confirmation.
@@ -395,8 +405,30 @@ class MainWindow(QMainWindow):
 
         return account.username if account else "(not signed in — you will be asked)"
 
+    def _sending_mailbox(self) -> str:
+        """What the next run would send from, which is the field and not the config file."""
+        return self.send.mailbox_field.text().strip()
+
+    def _sender_name(self, mailbox: str | None = None) -> str:
+        """Who the mail comes from, for the title bar and the confirmation."""
+        account = self._account_name()
+        mailbox = self._sending_mailbox() if mailbox is None else mailbox
+
+        # -- `_account_name` answers with a parenthesised placeholder when there is no account to
+        #    name, and "info@... (signed in as (not signed in))" reads as a contradiction of
+        #    itself. The mailbox beside the placeholder says the same thing and reads.
+        if mailbox and account.startswith("("):
+            return f"{mailbox} {account}"
+        return describe_sender(mailbox, account)
+
     def _show_account(self) -> None:
-        self.setWindowTitle(f"kasseimail — {self._account_name()}")
+        """The title bar says who the mail comes from, not only who is signed in.
+
+        Those are the same thing until a shared mailbox is configured, and after that the
+        difference is the whole point: a window titled with your own address while every message
+        leaves from info@ is exactly the kind of quiet wrongness this tool is built against.
+        """
+        self.setWindowTitle(f"kasseimail — {self._sender_name()}")
 
     def _sign_in(self) -> None:
         """Sign in from the menu, so it can be done before a run rather than during one.
@@ -455,13 +487,22 @@ class MainWindow(QMainWindow):
         self._show_account()
 
     def _edit_credentials(self) -> None:
-        """The tenant and client id, written to the config file the CLI reads too."""
+        """The tenant, the client id and the default mailbox, in the config file the CLI reads too."""
         dialog = QDialog(self)
         dialog.setWindowTitle("Credentials")
         dialog.setMinimumWidth(460)
 
         tenant = QLineEdit(self.settings.tenant_id or "")
         client = QLineEdit(self.settings.client_id or "")
+
+        mailbox = QLineEdit(self.settings.mailbox or "")
+        mailbox.setPlaceholderText("your own mailbox")
+        mailbox.setToolTip(
+            "The mailbox every run starts from, e.g. a shared info@ address. It fills the "
+            "'Send from' box, which can still be changed for one run.\n"
+            "'Send As' or 'Send on behalf' on that mailbox has to be granted in Exchange; the "
+            "app registration's permissions do not grant it."
+        )
 
         explanation = QLabel(
             "The Entra ID app registration kasseimail signs in through. There is no secret: it is "
@@ -485,6 +526,7 @@ class MainWindow(QMainWindow):
         form = QFormLayout()
         form.addRow("Tenant ID", tenant)
         form.addRow("Client ID", client)
+        form.addRow("Send from", mailbox)
 
         layout = QVBoxLayout(dialog)
         layout.addWidget(explanation)
@@ -495,11 +537,22 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.Accepted:
             return
 
+        was = self.settings.mailbox
         config.write_config_file({
             "tenant_id": tenant.text().strip() or None,
             "client_id": client.text().strip() or None,
+            # -- "" and not None: clearing the box has to mean "send from my own mailbox again",
+            #    and a None would leave whatever is in the file.
+            "mailbox": mailbox.text().strip(),
         })
         self.settings = config.load_settings(template_dir=self.settings.template_dir)
+
+        # -- follow the setting with the field, unless this run was deliberately pointed somewhere
+        #    else. Saving a new default and having the old one silently win is the sort of quiet
+        #    disagreement that puts mail in the wrong Sent Items.
+        if self._sending_mailbox() in ("", was):
+            self.send.mailbox_field.setText(self.settings.mailbox)
+
         self._show_account()
         logger.info("credentials saved to {}", config.config_path())
 
@@ -552,6 +605,15 @@ class MainWindow(QMainWindow):
             if value:
                 field.setText(str(value))
 
+        # -- the configured mailbox is the default and the remembered one overrides it, including
+        #    when it was deliberately emptied: `value(key, None)` tells "never set" from "set to
+        #    nothing", which the loop above cannot, and only the first of those means "use the
+        #    config file".
+        remembered = self.store.value("mailbox", None)
+        self.send.mailbox_field.setText(
+            self.settings.mailbox if remembered is None else str(remembered)
+        )
+
         self.send.pause.setValue(int(float(self.store.value("pause", self.settings.pause))))
 
     def _remember(self) -> None:
@@ -563,6 +625,7 @@ class MainWindow(QMainWindow):
             self.store.setValue("data_file", str(self.recipients.table.path))
 
         self.store.setValue("out", self.send.out_field.text())
+        self.store.setValue("mailbox", self.send.mailbox_field.text())
         self.store.setValue("test_to", self.send.test_to.text())
         self.store.setValue("attach", self.send.attach_field.text())
         self.store.setValue("pattern", self.send.pattern_field.text())

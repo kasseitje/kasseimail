@@ -68,6 +68,10 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--tenant", metavar="ID", help="Entra ID tenant (default: KASSEIMAIL_TENANT_ID)")
     common.add_argument("--client-id", metavar="ID",
                         help="app registration (default: KASSEIMAIL_CLIENT_ID)")
+    common.add_argument("--mailbox", metavar="ADDRESS",
+                        help="send from this mailbox instead of your own, e.g. a shared "
+                             "info@ address. You need 'Send As' or 'Send on behalf' on it. "
+                             "(default: KASSEIMAIL_MAILBOX)")
 
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
@@ -194,6 +198,8 @@ def build_parser() -> argparse.ArgumentParser:
     config_set = config_actions.add_parser("set", help="write a setting to the config file")
     config_set.add_argument("--tenant-id")
     config_set.add_argument("--client-id")
+    config_set.add_argument("--mailbox", metavar="ADDRESS",
+                            help="the mailbox to send from; empty string to send from your own")
     config_set.add_argument("--template-dir")
     config_set.add_argument("--pause", type=float)
     configure.set_defaults(func=cmd_config)
@@ -228,6 +234,7 @@ def _settings(args):
     return config.load_settings(
         tenant_id=getattr(args, "tenant", None),
         client_id=getattr(args, "client_id", None),
+        mailbox=getattr(args, "mailbox", None),
         template_dir=getattr(args, "templates", None),
         pause=getattr(args, "pause", None),
     )
@@ -293,6 +300,7 @@ def _build_run(args, settings, mode: str) -> SendRun:
         cc=getattr(args, "cc", None),
         bcc=getattr(args, "bcc", None),
         reply_to=getattr(args, "reply_to", None),
+        mailbox=settings.mailbox,
         settings=settings,
     )
 
@@ -366,6 +374,10 @@ def _confirm(run: SendRun, found, mode: str) -> bool:
     print(f"  {verb} {len(found.sendable)} message(s)")
     print(f"  template   {run.template.name}")
     print(f"  recipients {where}")
+    if run.mailbox:
+        # -- only when it is not your own mailbox: the line is here to make an unusual sender
+        #    impossible to miss, and printing it every time is how it stops being read.
+        print(f"  from       {run.mailbox}")
     if run.cc or run.bcc:
         print(f"  cc/bcc     {', '.join(run.cc + run.bcc)}")
     print()
@@ -460,7 +472,11 @@ def cmd_login(args) -> int:
     settings = _settings(args)
     settings.require_credentials()
 
-    mailer = GraphMailer(settings.tenant_id, settings.client_id, settings.token_cache)
+    # -- with the mailbox, so the one device code already covers the shared permissions. Signing
+    #    in without it and configuring the mailbox afterwards means a second sign-in at the worst
+    #    moment: in the middle of the first real run.
+    mailer = GraphMailer(settings.tenant_id, settings.client_id, settings.token_cache,
+                         mailbox=settings.mailbox)
 
     existing = mailer.cached_account()
     if existing:
@@ -469,6 +485,8 @@ def cmd_login(args) -> int:
     mailer.sign_in(on_device_code=_print_device_code)
     account = mailer.cached_account()
     logger.info("signed in as {}", account.username if account else "(unknown)")
+    if settings.mailbox:
+        logger.info("mail will be sent from {}", settings.mailbox)
     logger.info("token cached at {} (0600)", settings.token_cache)
     return 0
 
@@ -495,6 +513,9 @@ def cmd_config(args) -> int:
         written = config.write_config_file({
             "tenant_id": args.tenant_id,
             "client_id": args.client_id,
+            # -- an empty string is a value here and not "unset": it is how you say "send from my
+            #    own mailbox again" without editing the file by hand.
+            "mailbox": args.mailbox.strip() if args.mailbox is not None else None,
             "template_dir": args.template_dir,
             "pause": args.pause,
         })
@@ -509,10 +530,13 @@ def cmd_config(args) -> int:
           f"{'' if settings.token_cache.is_file() else '  (not signed in)'}")
     print(f"  tenant id      {settings.tenant_id or '(not set)'}   [{settings.sources['tenant_id']}]")
     print(f"  client id      {settings.client_id or '(not set)'}   [{settings.sources['client_id']}]")
+    print(f"  send from      {settings.mailbox or '(your own mailbox)'}   "
+          f"[{settings.sources['mailbox']}]")
     print(f"  pause          {settings.pause}s   [{settings.sources['pause']}]")
 
     if settings.tenant_id and settings.client_id:
-        mailer = GraphMailer(settings.tenant_id, settings.client_id, settings.token_cache)
+        mailer = GraphMailer(settings.tenant_id, settings.client_id, settings.token_cache,
+                             mailbox=settings.mailbox)
         account = mailer.cached_account()
         print(f"  signed in as   {account.username if account else '(nobody)'}")
 

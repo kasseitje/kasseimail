@@ -75,6 +75,15 @@ class SendPanel(QWidget):
             "subject, and a row without an address is still skipped."
         )
 
+        self.mailbox_field = QLineEdit()
+        self.mailbox_field.setPlaceholderText("your own mailbox")
+        self.mailbox_field.setToolTip(
+            "Send from a shared mailbox instead of your own, e.g. info@example.be.\n"
+            "You need 'Send As' or 'Send on behalf' on it, granted in Exchange -- signing in is "
+            "not enough.\nDrafts then land in that mailbox's Drafts, and sent mail in its Sent "
+            "Items.\nEmpty means the account you are signed in with."
+        )
+
         self.cc_field = QLineEdit()
         self.cc_field.setPlaceholderText("books@example.be; boss@example.be")
 
@@ -113,6 +122,7 @@ class SendPanel(QWidget):
         limits.addStretch(1)
 
         delivery = QFormLayout()
+        delivery.addRow("Send from", self.mailbox_field)
         delivery.addRow("Send all to", self.test_to)
         delivery.addRow("Cc", self.cc_field)
         delivery.addRow("Bcc", self.bcc_field)
@@ -198,6 +208,7 @@ class SendPanel(QWidget):
 
     def run_options(self) -> dict:
         return {
+            "mailbox": self.mailbox_field.text().strip(),
             "test_to": self.test_to.text().strip() or None,
             "cc": _split(self.cc_field.text()),
             "bcc": _split(self.bcc_field.text()),

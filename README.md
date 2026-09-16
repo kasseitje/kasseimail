@@ -48,6 +48,10 @@ application in your tenant.
 3. **API permissions → Add a permission → Microsoft Graph → Delegated permissions.**
    Add `Mail.Send` and `Mail.ReadWrite`. `User.Read` is already there and can stay.
    No admin consent is needed for these — each user consents for themselves at first sign-in.
+   Add `Mail.Send.Shared` and `Mail.ReadWrite.Shared` as well **only** if you will send from a
+   shared mailbox — see [Sending from a shared mailbox](#sending-from-a-shared-mailbox). They are
+   asked for at sign-in only when one is configured, so nobody consents to "send mail on behalf of
+   others" to send their own mail.
 4. **Authentication → Advanced settings → Allow public client flows → Yes.**
    This one gets forgotten, and without it Entra refuses the device code with **AADSTS7000218**.
 
@@ -261,6 +265,54 @@ resume shifts the row numbers, and those rows go out again: resume against the f
 `--pause` defaults to 2.5 seconds because Exchange Online passes 30 messages a minute on client
 submission. A 429 or 503 is honoured with its `Retry-After` and retried up to four times.
 
+## Sending from a shared mailbox
+
+Mail normally leaves the mailbox you signed in with. To send from another one — a shared
+`info@`, say, while you sign in as yourself — name it:
+
+```bash
+kasseimail config set --mailbox info@example.be          # the default for every run
+kasseimail send -t welcome -d people.xlsx --mailbox info@example.be --send   # just this one
+```
+
+`KASSEIMAIL_MAILBOX` works too, and an empty value means your own mailbox again:
+
+```bash
+kasseimail config set --mailbox ""
+```
+
+In the window it is the **Send from** box in the Delivery group, filled from the configuration and
+changeable for one run. Account → Credentials sets the default. The title bar and the confirmation
+both name the mailbox mail will come from, beside the account it is signed in with.
+
+**Two permissions, and the one people miss is not the Graph one.** `Mail.Send.Shared` and
+`Mail.ReadWrite.Shared` let the *app* act on a mailbox you have been given access to; they do not
+give you that access. That is granted on the mailbox itself, by an administrator, in the Exchange
+admin centre under **Recipients → Mailboxes → the mailbox → Delegation**:
+
+- **Send as** — the mail comes from `info@example.be`, with nothing about you in the header.
+- **Send on behalf** — it comes from `you@example.be on behalf of info@example.be`.
+- **Read and manage (Full Access)** — needed for drafts, because a draft has to live in the mailbox
+  it will be sent from.
+
+With both Send as and Send on behalf granted, Exchange uses Send as. A newly granted right can take
+a while to take effect.
+
+Where things land follows the mailbox, not you: `--drafts` leaves the messages in **its** Drafts,
+where the people who share it can look them over, and a send files a copy in **its** Sent Items.
+
+The first run after configuring a mailbox asks for a device code again — the sign-in has two more
+permissions to consent to. `kasseimail login` gets that out of the way beforehand. Then rehearse
+once, which proves the permission without putting anything in anybody's inbox:
+
+```bash
+kasseimail send -t welcome -d people.xlsx --limit 1 --drafts        # appears in info@'s Drafts
+kasseimail send -t welcome -d people.xlsx --limit 1 --send --test-to me@ours.be
+```
+
+A `403` here is the Exchange side, not the app registration: the error says so and names the
+mailbox.
+
 ## The window
 
 ```bash
@@ -280,6 +332,9 @@ worker thread — Cancel stops it between messages, never in the middle of one.
 - **Group by** collapses the table to one line per message, and **Combine...** says how each column
   is aggregated. With grouping on, the arrows step between groups, and the Rows column names every
   spreadsheet row each message came from.
+- **Send from** picks the mailbox for this run, empty being your own. It starts at whatever
+  Account → Credentials holds, and the title bar names whichever it ends up being — see
+  [Sending from a shared mailbox](#sending-from-a-shared-mailbox).
 
 ## Output
 

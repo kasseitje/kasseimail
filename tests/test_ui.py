@@ -311,6 +311,109 @@ def test_pending_edits_are_written_before_a_run_is_built(window):
     assert run.template.render(context).subject == "Edited subject"
 
 
+# -- which mailbox it comes from ---------------------------------------------------------------
+
+def test_the_mailbox_typed_in_the_window_reaches_the_run(window):
+    """The field is the whole of choosing a sender: nothing else in the window decides it, and a
+    run that ignored it would send from the signed-in account with no sign that it had."""
+    window.send.mailbox_field.setText("  info@example.be ")
+
+    assert window._build_run(MODE_SEND).mailbox == "info@example.be"
+
+
+def test_clearing_the_field_sends_from_your_own_mailbox_again(window):
+    """Emptying it has to beat the configured default. Falling back to the config file there --
+    which is what `or` does -- would keep sending from the shared mailbox after somebody had
+    deliberately said not to."""
+    window.settings.mailbox = "info@example.be"
+    window.send.mailbox_field.setText("")
+
+    assert window._build_run(MODE_SEND).mailbox == ""
+
+
+def test_the_confirmation_says_which_mailbox_the_mail_comes_from(window, dialogs):
+    """The last screen between a typo and mail that cannot be recalled. It names both halves: the
+    address that will be on the mail, and the account whose rights put it there."""
+    window._account_name = lambda: "bino@example.be"
+    window.send.mailbox_field.setText("info@example.be")
+    run = window._build_run(MODE_SEND)
+
+    window._confirm(run, run.preflight(), MODE_SEND)
+
+    text = [text for kind, _title, text in dialogs if kind == "confirm"][-1]
+    assert "From:        info@example.be (signed in as bino@example.be)" in text
+
+
+def test_an_unknown_account_is_not_worded_as_a_contradiction(window):
+    """`_account_name` answers with a parenthesised placeholder when nobody is signed in, and
+    "info@... (signed in as (not signed in))" says two opposite things in one line."""
+    window._account_name = lambda: "(not signed in — you will be asked)"
+    window.send.mailbox_field.setText("info@example.be")
+
+    assert window._sender_name() == "info@example.be (not signed in — you will be asked)"
+
+
+def test_signing_in_from_the_menu_asks_for_what_the_next_run_will_need(window):
+    """The menu exists to get the device code over with *before* a run. Built with the configured
+    mailbox instead of the typed one, it would consent to the wrong permissions and the run would
+    stop for a second device code half way down the spreadsheet."""
+    window.settings.tenant_id = "00000000-0000-0000-0000-000000000000"
+    window.settings.client_id = "client-id"
+    window.send.mailbox_field.setText("info@example.be")
+
+    mailer = window._mailer()
+
+    assert mailer.mailbox == "info@example.be"
+    assert "Mail.Send.Shared" in mailer.scopes
+
+
+def test_the_title_bar_names_the_mailbox_being_sent_from(window):
+    """A window titled with your own address while every message leaves from info@ is the quiet
+    kind of wrong this tool is built against."""
+    window.send.mailbox_field.setText("info@example.be")
+    window.send.mailbox_field.editingFinished.emit()
+
+    assert "info@example.be" in window.windowTitle()
+
+
+def test_the_field_is_filled_from_the_configuration_when_nothing_was_remembered(qt_app, dialogs,
+                                                                                template_dir,
+                                                                                tmp_path):
+    """Otherwise a mailbox set once in Account -> Credentials has to be typed again every session,
+    and the run that forgets it is the one nobody notices."""
+    from PySide6.QtCore import QSettings
+
+    settings = config.load_settings(template_dir=template_dir)
+    settings.mailbox = "info@example.be"
+    window = MainWindow(settings, store=QSettings(str(tmp_path / "fresh.ini"), QSettings.IniFormat))
+
+    try:
+        assert window.send.mailbox_field.text() == "info@example.be"
+    finally:
+        window.log.detach()
+        window.close()
+
+
+def test_a_mailbox_deliberately_emptied_stays_empty_next_session(qt_app, dialogs, template_dir,
+                                                                 tmp_path):
+    """The remembered value has to be able to be nothing. Treated as 'never set', the config file
+    would put the shared mailbox back every time the window opened."""
+    from PySide6.QtCore import QSettings
+
+    store = QSettings(str(tmp_path / "state.ini"), QSettings.IniFormat)
+    store.setValue("mailbox", "")
+
+    settings = config.load_settings(template_dir=template_dir)
+    settings.mailbox = "info@example.be"
+    window = MainWindow(settings, store=store)
+
+    try:
+        assert window.send.mailbox_field.text() == ""
+    finally:
+        window.log.detach()
+        window.close()
+
+
 # -- signing in ------------------------------------------------------------------------------------
 
 class PollingMailer:

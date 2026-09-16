@@ -219,6 +219,7 @@ class SendRun:
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
         reply_to: list[str] | None = None,
+        mailbox: str | None = None,
         settings=None,
         mailer: GraphMailer | None = None,
     ):
@@ -235,6 +236,16 @@ class SendRun:
         self.pause = max(0.0, float(pause))
         self.limit = limit
         self.settings = settings
+
+        # -- which mailbox this leaves from; empty is the signed-in user's own.
+        #
+        #    **`None` and `""` are different on purpose.** `None` is "this run did not say", and
+        #    the settings decide. `""` is a front end saying *my own mailbox*, and it has to win
+        #    over a configured one -- the window's Send-from box is emptied to mean exactly that,
+        #    and a fallback there would quietly send from the shared mailbox anyway.
+        if mailbox is None:
+            mailbox = getattr(settings, "mailbox", "") or ""
+        self.mailbox = mailbox.strip()
 
         # -- meta.toml says what this template always does; the flags say what this run does on top
         #    of it. Added rather than replaced: a standing cc in the template is a policy, and a
@@ -255,6 +266,14 @@ class SendRun:
 
         found = Preflight()
         found.warnings.extend(self.table.warnings)
+
+        # -- a mistyped sender is the repeating failure this phase is for: Graph answers the same
+        #    403 to every row, so the run reads as seventy problems rather than one.
+        if self.mailbox and not EMAIL_PATTERN.match(self.mailbox):
+            found.errors.append(
+                f"'{self.mailbox}' is not a usable mailbox to send from; it has to be a full "
+                "address, like info@example.be"
+            )
 
         missing_columns = [
             column for column in self.template.meta.required if column not in self.table.headers
@@ -491,7 +510,8 @@ class SendRun:
         stem = f"{plan.row:04d}-{_slug(plan.key)}"
 
         header = (
-            f"To: {plan.address}\n"
+            (f"From: {self.mailbox}\n" if self.mailbox else "")
+            + f"To: {plan.address}\n"
             + (f"Cc: {', '.join(self.cc)}\n" if self.cc else "")
             + (f"Bcc: {', '.join(self.bcc)}\n" if self.bcc else "")
             + f"Subject: {plan.rendered.subject}\n"
@@ -518,12 +538,15 @@ class SendRun:
 
         self.settings.require_credentials()
         self._mailer = GraphMailer(
-            self.settings.tenant_id, self.settings.client_id, self.settings.token_cache
+            self.settings.tenant_id, self.settings.client_id, self.settings.token_cache,
+            mailbox=self.mailbox,
         ).sign_in(on_device_code=on_device_code)
 
         account = self._mailer.cached_account()
         if account:
             logger.info("signed in as {}", account.username)
+        if self.mailbox:
+            logger.info("sending from {}, not from the signed-in mailbox", self.mailbox)
 
 
 def interruptible_sleep(seconds: float, should_cancel=None, slice_seconds: float = 0.1) -> bool:
