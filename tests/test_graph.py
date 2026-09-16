@@ -9,11 +9,45 @@ import time
 
 import pytest
 
-from kasseimail.graph import GraphMailer, SignInProblem
+from kasseimail.graph import SCOPES, SHARED_SCOPES, GraphMailer, SignInProblem, describe_sender
 
 
-def mailer(tenant="00000000-0000-0000-0000-000000000000", client="client-id", cache="token.json"):
-    return GraphMailer(tenant, client, cache)
+def mailer(tenant="00000000-0000-0000-0000-000000000000", client="client-id", cache="token.json",
+           mailbox=""):
+    return GraphMailer(tenant, client, cache, mailbox=mailbox)
+
+
+class FakeResponse:
+    status_code = 200
+    headers: dict = {}
+    text = "{}"
+
+    def json(self):
+        return {"id": "AAMk-draft", "uploadUrl": "https://upload.example/session"}
+
+
+class FakeSession:
+    """Records the URLs instead of calling them. There is no tenant here to call."""
+
+    def __init__(self):
+        self.urls = []
+
+    def request(self, method, url, **kwargs):
+        self.urls.append((method, url))
+        return FakeResponse()
+
+    def put(self, url, **kwargs):
+        self.urls.append(("PUT", url))
+        return FakeResponse()
+
+
+def signed_in(mailbox=""):
+    """A mailer past the sign-in, without MSAL: a token that has not expired is simply used."""
+    built = mailer(mailbox=mailbox)
+    built._session = FakeSession()
+    built._token = "an-access-token"
+    built._expires_at = time.time() + 3600
+    return built
 
 
 # -- what people paste ---------------------------------------------------------------------------
@@ -28,12 +62,108 @@ def test_a_pasted_credential_keeps_no_whitespace_or_quotes():
     assert built.client_id == "client-id"
 
 
+def test_a_pasted_mailbox_keeps_no_whitespace_or_quotes():
+    """It arrives by paste like the other two, and it goes into a URL path. A trailing space there
+    is a 404 from Graph naming a mailbox that looks exactly right on screen."""
+    assert mailer(mailbox=' "info@example.be" \n').mailbox == "info@example.be"
+
+
 def test_no_credentials_at_all_is_refused_by_name():
     with pytest.raises(SignInProblem):
         GraphMailer("", "client", "token.json")
 
     with pytest.raises(SignInProblem):
         GraphMailer("tenant", "   ", "token.json")
+
+
+# -- which mailbox the mail leaves from --------------------------------------------------------
+
+def test_without_a_mailbox_every_call_still_goes_to_me():
+    """The default is the one worth pinning. Every other failure in this tool announces itself;
+    sending from the wrong mailbox does not -- the mail goes out, it just comes from somebody
+    else, and nothing in the run or the report says so."""
+    built = signed_in()
+
+    built.send_direct({"subject": "x"})
+    message_id = built.create_draft({"subject": "x"})
+    built.send_draft(message_id)
+    built.delete_message(message_id)
+
+    assert [url for _, url in built._session.urls] == [
+        "https://graph.microsoft.com/v1.0/me/sendMail",
+        "https://graph.microsoft.com/v1.0/me/messages",
+        f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/send",
+        f"https://graph.microsoft.com/v1.0/me/messages/{message_id}",
+    ]
+
+
+def test_a_mailbox_sends_drafts_and_uploads_through_that_mailbox(tmp_path):
+    """The URL is the sender: a message carries no `from`, so `/users/info@.../` is the whole of
+    sending as a shared mailbox. Miss one of these and the mail leaves from info@ while its draft
+    or its large attachment goes to the signed-in user's own mailbox, where Graph answers 404 for
+    a message id that exists -- in the other mailbox."""
+    built = signed_in(mailbox="info@example.be")
+    attachment = _attachment(tmp_path)
+
+    built.send_direct({"subject": "x"})
+    message_id = built.create_draft({"subject": "x"})
+    built.upload_attachment(message_id, attachment)
+    built.send_draft(message_id)
+
+    base = "https://graph.microsoft.com/v1.0/users/info@example.be"
+    assert [url for _, url in built._session.urls] == [
+        f"{base}/sendMail",
+        f"{base}/messages",
+        f"{base}/messages/{message_id}/attachments/createUploadSession",
+        "https://upload.example/session",
+        f"{base}/messages/{message_id}/send",
+    ]
+
+
+def test_an_address_that_would_break_the_url_is_escaped():
+    """A local part may hold a `#` or a `?`, and unescaped those end the path -- the request then
+    goes to `/users/some` and Graph refuses something nobody typed."""
+    assert signed_in(mailbox="a#b?c@example.be").base == (
+        "https://graph.microsoft.com/v1.0/users/a%23b%3Fc@example.be"
+    )
+
+
+def test_the_shared_permissions_are_asked_for_only_when_a_mailbox_is_set():
+    """`Mail.Send.Shared` is 'send mail on behalf of others', and nobody should have to consent to
+    that to send their own mail. It is also the reason a run that starts using a shared mailbox
+    asks for a device code once more."""
+    assert mailer().scopes == SCOPES
+    assert mailer(mailbox="info@example.be").scopes == SCOPES + SHARED_SCOPES
+
+
+def test_a_refusal_from_a_shared_mailbox_says_where_the_rights_come_from():
+    """Graph answers a bare 'Access is denied' whether the mailbox does not exist or was never
+    shared with you -- and the app registration's permission is not what grants it. Without this
+    the same six words come back once per row and the run reads as seventy problems."""
+    hint = signed_in(mailbox="info@example.be")._mailbox_hint(403)
+
+    assert "info@example.be" in hint
+    assert "Send As" in hint or "Send on behalf" in hint
+    # -- your own mailbox refusing is a different problem, and this advice would mislead.
+    assert signed_in()._mailbox_hint(403) == ""
+    assert signed_in(mailbox="info@example.be")._mailbox_hint(429) == ""
+
+
+def test_the_sender_is_described_with_both_halves():
+    """A confirmation naming only the shared mailbox hides which login is about to be used, and
+    one naming only the login hides that the mail is not coming from it."""
+    assert describe_sender("", "bino@example.be") == "bino@example.be"
+    assert describe_sender("info@example.be", "bino@example.be") == (
+        "info@example.be (signed in as bino@example.be)"
+    )
+
+
+def _attachment(tmp_path):
+    from kasseimail.attachments import Attachment
+
+    path = tmp_path / "invoice.pdf"
+    path.write_bytes(b"%PDF-1.4 a small one")
+    return Attachment(path=path, size=path.stat().st_size)
 
 
 # -- errors that used to escape --------------------------------------------------------------------

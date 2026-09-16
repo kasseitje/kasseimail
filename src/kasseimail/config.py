@@ -1,9 +1,11 @@
 """Where things live, and which setting wins.
 
-Three places can name the tenant and the client id, and they are tried in this order:
+Three places can name the tenant, the client id and the mailbox to send from, and they are tried in
+this order:
 
-    1. the command line (`--tenant`, `--client-id`)
-    2. the environment (`KASSEIMAIL_TENANT_ID`, `KASSEIMAIL_CLIENT_ID`), `.env` included
+    1. the command line (`--tenant`, `--client-id`, `--mailbox`)
+    2. the environment (`KASSEIMAIL_TENANT_ID`, `KASSEIMAIL_CLIENT_ID`, `KASSEIMAIL_MAILBOX`),
+       `.env` included
     3. the config file (`kasseimail config path` prints it)
 
 A flag beats an environment that beats a file, which is the order of how deliberate each one is:
@@ -96,6 +98,10 @@ class Settings:
 
     tenant_id: str | None = None
     client_id: str | None = None
+    #: the mailbox mail leaves from, when that is not the signed-in user's own. Empty means `/me`
+    #: -- see `graph.GraphMailer`. Sending from another mailbox needs Send As or Send on Behalf on
+    #: it, granted in Exchange, on top of the delegated scopes.
+    mailbox: str = ""
     template_dir: Path = field(default_factory=default_template_dir)
     token_cache: Path = field(default_factory=token_cache_path)
     pause: float = DEFAULT_PAUSE_SECONDS
@@ -125,6 +131,7 @@ def load_settings(
     *,
     tenant_id: str | None = None,
     client_id: str | None = None,
+    mailbox: str | None = None,
     template_dir: str | Path | None = None,
     pause: float | None = None,
     config_file: Path | None = None,
@@ -149,6 +156,11 @@ def load_settings(
     settings.client_id, settings.sources["client_id"] = pick(
         client_id, "KASSEIMAIL_CLIENT_ID", "client_id", None
     )
+
+    raw_mailbox, settings.sources["mailbox"] = pick(
+        mailbox, "KASSEIMAIL_MAILBOX", "mailbox", ""
+    )
+    settings.mailbox = (raw_mailbox or "").strip()
 
     directory, settings.sources["template_dir"] = pick(
         str(template_dir) if template_dir else None,

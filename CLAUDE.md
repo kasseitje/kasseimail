@@ -67,6 +67,21 @@ matches the *last* extension and every template ends in `.j2`, so it would read 
 Sign-in is delegated device code: mail leaves your own mailbox and lands in your Sent Items, and
 there is no application permission reaching every mailbox in the tenant.
 
+**The URL is the sender.** A Graph message carries no `from`: `/me/sendMail` leaves your own mailbox
+and `/users/info@example.be/sendMail` leaves that one, and `GraphMailer.base` is the one place that
+chooses. So a shared mailbox is a substitution rather than a second code path — but every call has
+to use it, because a draft created under `/me` and sent under `/users/...` is a 404 for a message id
+that exists, in the other mailbox. Empty means `/me`, and that default is worth guarding: getting it
+wrong does not fail, the mail simply comes from the wrong address and nothing says so. `None` and
+`""` differ where a run is built — `None` is "this run did not say" and the settings decide, `""` is
+a front end saying *my own mailbox*, which is what the window's emptied Send-from box means.
+
+`Mail.Send.Shared` / `Mail.ReadWrite.Shared` are asked for **only when a mailbox is set**; nobody
+should consent to "send mail on behalf of others" to send their own mail. The cost is one more
+device code the first time. And the scope is not what grants the access — Send As / Send on Behalf
+is granted on the mailbox in Exchange, which is why a 403 from a shared mailbox carries its own
+explanation rather than Graph's six words repeated once per row.
+
 **Paths are absolute.** `kpmail` kept its token cache at a relative `data/graph_token.json`, so
 running it from elsewhere silently started a second device-code login. Everything here is anchored
 to the user config and data directories.

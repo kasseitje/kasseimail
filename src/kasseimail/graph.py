@@ -10,6 +10,13 @@ scope it.
 it off by default for existing tenants at the end of 2026 and removes it after 2027. Graph also
 needs no per-mailbox SMTP AUTH, files the message in Sent Items, and can leave a draft instead of
 sending -- which is what makes a rehearsal possible.
+
+**The URL is the sender.** A message carries no `from`: `/me/sendMail` leaves your own mailbox and
+`/users/info@example.be/sendMail` leaves that one. Which of the two you get is `mailbox`, and
+everything else about the request is identical, so a shared mailbox is one substitution rather than
+a second code path. Exchange decides the header from the rights you actually hold -- Send As puts
+the shared mailbox in `From:`, Send on Behalf puts you there "on behalf of" it -- and those rights
+are granted on the mailbox itself, which no Graph scope can stand in for.
 """
 
 import os
@@ -17,6 +24,7 @@ import time
 
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 from loguru import logger
 
@@ -27,6 +35,13 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 
 #: `Mail.Send` sends, `Mail.ReadWrite` leaves a draft. Both delegated.
 SCOPES = ["Mail.Send", "Mail.ReadWrite"]
+
+#: the same two for a mailbox that is not yours, asked for **only when one is configured**. Nobody
+#: should have to consent to "send mail on behalf of others" to send their own mail, which is the
+#: same reasoning as the module docstring's case against an app-only registration. The cost is one
+#: extra consent the first time a mailbox is set; afterwards MSAL redeems the cached refresh token
+#: for either set without prompting again.
+SHARED_SCOPES = ["Mail.Send.Shared", "Mail.ReadWrite.Shared"]
 
 #: how often a message is retried after a 429 or a 503.
 MAX_RETRIES = 4
@@ -59,7 +74,8 @@ class Account:
 class GraphMailer:
     """A signed-in connection to one mailbox."""
 
-    def __init__(self, tenant_id: str, client_id: str, cache_path: str | Path):
+    def __init__(self, tenant_id: str, client_id: str, cache_path: str | Path,
+                 mailbox: str = ""):
         # -- stripped, because these arrive by paste. A trailing newline out of a browser or a
         #    stray quote out of a config file makes MSAL reject the authority URL, and the error
         #    it gives is about URL formats rather than about the invisible character.
@@ -72,6 +88,11 @@ class GraphMailer:
         self.tenant_id = tenant_id
         self.client_id = client_id
         self.cache_path = Path(cache_path)
+        #: whose mailbox this acts on. Empty is the signed-in user's own -- and that default is
+        #: worth keeping in mind, because getting it wrong does not fail: the mail goes out, from
+        #: the wrong address, and nothing in the run says so.
+        self.mailbox = (mailbox or "").strip().strip("\"'")
+        self.scopes = SCOPES + SHARED_SCOPES if self.mailbox else list(SCOPES)
 
         self._app = None
         self._cache = None
@@ -149,7 +170,7 @@ class GraphMailer:
         app = self._build_app()
 
         accounts = app.get_accounts()
-        result = app.acquire_token_silent(SCOPES, account=accounts[0]) if accounts else None
+        result = app.acquire_token_silent(self.scopes, account=accounts[0]) if accounts else None
 
         if not result:
             if silent_only:
@@ -166,7 +187,7 @@ class GraphMailer:
         return self
 
     def _device_flow(self, app, on_device_code) -> dict:
-        flow = app.initiate_device_flow(scopes=SCOPES)
+        flow = app.initiate_device_flow(scopes=self.scopes)
         if "user_code" not in flow:
             raise SignInProblem(
                 "Could not start the device code flow: "
@@ -236,7 +257,7 @@ class GraphMailer:
 
         app = self._build_app()
         accounts = app.get_accounts()
-        result = app.acquire_token_silent(SCOPES, account=accounts[0]) if accounts else None
+        result = app.acquire_token_silent(self.scopes, account=accounts[0]) if accounts else None
 
         if not result or "access_token" not in result:
             if self._token and time.time() < self._expires_at:
@@ -251,6 +272,18 @@ class GraphMailer:
         return self._token
 
     # -- talking to Graph ---------------------------------------------------------------------
+
+    @property
+    def base(self) -> str:
+        """What every call hangs off: your own mailbox, or the one you were given rights on.
+
+        This one substitution is the whole of sending from a shared mailbox. `quote` because an
+        address is a path segment here, and a `#` or a `+` in a local part would otherwise end the
+        path or become a space.
+        """
+        if not self.mailbox:
+            return f"{GRAPH}/me"
+        return f"{GRAPH}/users/{quote(self.mailbox, safe='@.')}"
 
     def _request(self, method: str, url: str, **kwargs):
         """One call, honouring `Retry-After`.
@@ -279,8 +312,29 @@ class GraphMailer:
                 raise GraphProblem("cancelled while waiting out Graph's throttling")
 
         if response.status_code >= 400:
-            raise GraphProblem(f"Graph {response.status_code}: {_graph_error(response)}")
+            raise GraphProblem(
+                f"Graph {response.status_code}: {_graph_error(response)}"
+                + self._mailbox_hint(response.status_code)
+            )
         return response
+
+    def _mailbox_hint(self, status: int) -> str:
+        """Why a shared mailbox refuses, added once to the error rather than guessed at.
+
+        Graph answers "Access is denied" whether the mailbox does not exist, or exists and has not
+        been shared with you -- and the delegated scope is not what grants that; the rights are
+        granted on the mailbox itself. Without this the same six words come back once per row, and
+        the run looks like seventy separate failures instead of one misconfiguration.
+        """
+        if not self.mailbox or status not in (403, 404):
+            return ""
+        return (
+            f"\n\nThis was addressed to {self.mailbox}, which is not the mailbox you signed in "
+            "with. Sending from it needs 'Send As' or 'Send on behalf' granted on the mailbox "
+            "itself, in the Exchange admin centre -- the Mail.Send.Shared permission on the app "
+            "registration does not grant it, and a right just granted can take a while to take "
+            "effect.\nLeave the mailbox empty to send from your own again."
+        )
 
     def _post(self, url: str, payload: dict):
         return self._request("POST", url, json=payload,
@@ -288,16 +342,20 @@ class GraphMailer:
 
     def send_direct(self, message: dict) -> str:
         """Send in one request. Returns an empty id -- a 202 carries no body to take one from."""
-        self._post(f"{GRAPH}/me/sendMail", {"message": message, "saveToSentItems": True})
+        self._post(f"{self.base}/sendMail", {"message": message, "saveToSentItems": True})
         return ""
 
     def create_draft(self, message: dict) -> str:
-        """Leave the message in Drafts. Returns its id, which is how to find it in Outlook."""
-        response = self._post(f"{GRAPH}/me/messages", message)
+        """Leave the message in Drafts. Returns its id, which is how to find it in Outlook.
+
+        In *that mailbox's* Drafts, when one is set: a draft has to live where it will be sent
+        from, which is also what makes a shared mailbox reviewable by the people who share it.
+        """
+        response = self._post(f"{self.base}/messages", message)
         return (response.json() or {}).get("id", "")
 
     def send_draft(self, message_id: str) -> None:
-        self._post(f"{GRAPH}/me/messages/{message_id}/send", {})
+        self._post(f"{self.base}/messages/{message_id}/send", {})
 
     def delete_message(self, message_id: str) -> None:
         """Clean up a draft whose attachments failed to upload.
@@ -306,7 +364,7 @@ class GraphMailer:
         person recovering has to tell them apart from the ones they meant to keep.
         """
         try:
-            self._request("DELETE", f"{GRAPH}/me/messages/{message_id}")
+            self._request("DELETE", f"{self.base}/messages/{message_id}")
         except GraphProblem as exc:
             logger.warning("could not remove the incomplete draft {}: {}", message_id, exc)
 
@@ -320,7 +378,7 @@ class GraphMailer:
         answer 401 to an otherwise correct upload.
         """
         session = self._post(
-            f"{GRAPH}/me/messages/{message_id}/attachments/createUploadSession",
+            f"{self.base}/messages/{message_id}/attachments/createUploadSession",
             {
                 "AttachmentItem": {
                     "attachmentType": "file",
@@ -379,6 +437,18 @@ class GraphMailer:
             raise
 
         return message_id
+
+
+def describe_sender(mailbox: str, account_name: str) -> str:
+    """Who the mail will come from, wherever that has to be shown beside the account.
+
+    Both halves, because both matter: the address that will be on the mail, and the account whose
+    rights put it there. A window titled only "info@..." hides which login is about to be used,
+    and one titled only with the login hides that the mail is not coming from it.
+    """
+    if not mailbox:
+        return account_name
+    return f"{mailbox} (signed in as {account_name})"
 
 
 def _graph_error(response) -> str:

@@ -217,8 +217,16 @@ def dialogs(monkeypatch):
     for name in ("information", "warning", "critical", "question", "about"):
         monkeypatch.setattr(QMessageBox, name, staticmethod(record(name)))
 
-    # -- the send confirmation builds a QMessageBox rather than calling a static method.
-    monkeypatch.setattr(QMessageBox, "exec", lambda self: shown.append(
-        ("confirm", self.windowTitle(), self.text())) or QMessageBox.Yes)
+    # -- the send confirmation builds a QMessageBox rather than calling a static method. Its
+    #    informative text is recorded with the question, because that is where what is actually
+    #    being agreed to lives: the count, the template, and which mailbox it comes from.
+    def confirm(self):
+        shown.append((
+            "confirm", self.windowTitle(),
+            "\n".join(part for part in (self.text(), self.informativeText()) if part),
+        ))
+        return QMessageBox.Yes
+
+    monkeypatch.setattr(QMessageBox, "exec", confirm)
 
     return shown

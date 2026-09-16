@@ -106,6 +106,40 @@ def test_allowing_missing_attachments_sends_the_rest(simple, table, tmp_path, fa
     assert "attachments" not in mailer.sent[1].message
 
 
+def test_a_mailbox_that_is_not_an_address_is_refused_before_anything_is_sent(simple, table,
+                                                                            tmp_path):
+    """A typo in the mailbox to send from is the repeating failure preflight exists for: Graph
+    answers the same 403 to every row, so a run of seventy reads as seventy problems."""
+    run = build(simple, table, tmp_path, mode=MODE_SEND, mailbox="info@")
+
+    found = run.preflight()
+
+    assert not found.ok
+    assert "info@" in found.errors[0]
+
+
+def test_an_empty_mailbox_beats_a_configured_one(simple, table, tmp_path):
+    """`None` means the run did not say and the settings decide; `""` is a front end saying 'my
+    own mailbox'. The window's Send-from box is emptied to mean exactly that, and falling back to
+    the configured mailbox there would send from the shared one anyway."""
+    from kasseimail.config import Settings
+
+    settings = Settings(mailbox="info@example.be")
+
+    assert build(simple, table, tmp_path, settings=settings).mailbox == "info@example.be"
+    assert build(simple, table, tmp_path, settings=settings, mailbox="").mailbox == ""
+
+
+def test_the_written_body_says_which_mailbox_it_came_from(simple, table, tmp_path):
+    """That file is the answer to 'what exactly went to row 3', and who it came from is part of
+    the answer -- particularly for a mailbox several people send from."""
+    build(simple, table, tmp_path, mailbox="info@example.be").execute()
+
+    written = sorted((tmp_path / "out" / "messages").glob("*.txt"))[0].read_text()
+
+    assert written.startswith("From: info@example.be\nTo: ")
+
+
 # -- rows that are skipped --------------------------------------------------------------------
 
 def test_a_row_without_an_address_is_skipped_and_still_named_in_the_report(simple, table,
